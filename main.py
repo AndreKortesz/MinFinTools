@@ -114,7 +114,7 @@ async def generate_post_text(user_prompt):
                 ],
                 max_tokens=300,
                 temperature=0.7,
-                timeout=30  # Добавлен таймаут для предотвращения зависаний
+                timeout=30
             )
             content = response.choices[0].message.content.strip().replace("###", "")
             if len(content) <= 1015:
@@ -148,7 +148,7 @@ async def generate_image(title_line, style="news"):
             size="1024x1024",
             quality="standard",
             n=1,
-            timeout=30  # Таймаут для изображений
+            timeout=30
         )
         return response.data[0].url
     except Exception as e:
@@ -219,6 +219,11 @@ async def scheduled_news_post(context: ContextTypes.DEFAULT_TYPE):
 
 async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Проверка и настройка JobQueue
+    if not app.job_queue:
+        logger.error("JobQueue не настроен. Установите python-telegram-bot[job-queue].")
+        raise RuntimeError("Отсутствует JobQueue. Проверьте requirements.txt.")
 
     # Расписание (МСК)
     app.job_queue.run_daily(scheduled_news_post, time=time(9, 16, tzinfo=pytz.timezone("Europe/Moscow")))
