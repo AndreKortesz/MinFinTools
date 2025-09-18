@@ -1,6 +1,5 @@
 feedparser
 python-telegram-bot
 openai
-apscheduler
 python-dotenv
 pytz
