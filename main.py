@@ -9,7 +9,6 @@ import pytz
 import feedparser
 import re
 from dotenv import load_dotenv
-import httpx  # Для явного управления HTTP-клиентом
 
 # Загрузка env
 load_dotenv()
@@ -21,9 +20,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Инициализация клиента OpenAI с явным HTTP-клиентом без прокси
-http_client = httpx.Client(proxies=None)  # Явно отключаем прокси
-client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+# Инициализация клиента OpenAI
+if not OPENAI_API_KEY:
+    logger.error("OPENAI_API_KEY не установлен в переменных окружения.")
+    raise ValueError("Отсутствует OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Список рубрик и новостных тем
 rubrics = [
@@ -112,7 +113,8 @@ async def generate_post_text(user_prompt):
                     {"role": "user", "content": user_prompt}
                 ],
                 max_tokens=300,
-                temperature=0.7
+                temperature=0.7,
+                timeout=30  # Добавлен таймаут для предотвращения зависаний
             )
             content = response.choices[0].message.content.strip().replace("###", "")
             if len(content) <= 1015:
@@ -145,7 +147,8 @@ async def generate_image(title_line, style="news"):
             prompt=prompt,
             size="1024x1024",
             quality="standard",
-            n=1
+            n=1,
+            timeout=30  # Таймаут для изображений
         )
         return response.data[0].url
     except Exception as e:
@@ -195,7 +198,7 @@ async def scheduled_news_post(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%-d %B %Y")
     logger.info(f"⏳ Генерация новостного поста: {topic}")
 
-    rss_feed = feedparser.parse(rss_sources[topic][0])  # Берем первый источник
+    rss_feed = feedparser.parse(rss_sources[topic][0])
     rss_news = clean_html(rss_feed.entries[0].summary) if rss_feed.entries else "Нет актуальных новостей"
     if len(rss_news) > 500:
         rss_news = rss_news[:500] + "..."
