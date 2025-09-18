@@ -16,6 +16,14 @@ def home():
 def ping():
     return "OK", 200
 
+@app.route("/test")
+def manual_test():
+    try:
+        test_rubric_post("Финсовет дня")
+        return "✅ Тестовый пост отправлен!", 200
+    except Exception as e:
+        return f"❌ Ошибка: {e}", 500
+
 from datetime import datetime
 import pytz
 import feedparser
