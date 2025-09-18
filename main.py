@@ -237,9 +237,8 @@ def main():
     application.job_queue.run_daily(scheduled_news_post, time=datetime.time(hour=18, minute=47, tzinfo=pytz.timezone("Europe/Moscow")))
     application.job_queue.run_daily(scheduled_rubric_post, time=datetime.time(hour=20, minute=30, tzinfo=pytz.timezone("Europe/Moscow")))
 
-    # Запуск
+    # Тестовый запуск рубричного поста
     asyncio.run(scheduled_rubric_post(None))  # None как placeholder для context
-    application.run_polling()
 
-if __name__ == "__main__":
-    main()
+    # Запуск бота
+    application.run_polling()
