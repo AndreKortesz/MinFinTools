@@ -3,12 +3,13 @@ import json
 import logging
 import telegram
 from openai import OpenAI
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.async_ import AsyncScheduler
 from datetime import datetime
 import pytz
 import feedparser
 import re
 from dotenv import load_dotenv
+import asyncio
 
 # Загрузка env
 load_dotenv()
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Инициализация клиентов
 client = OpenAI(api_key=OPENAI_API_KEY)
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
-scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Moscow"))
+scheduler = AsyncScheduler(timezone=pytz.timezone("Europe/Moscow"))
 
 # Список рубрик и новостных тем
 rubrics = [
@@ -102,7 +103,7 @@ SYSTEM_PROMPT = (
     "— Подсчёт: 750 символов."
 )
 
-def generate_post_text(user_prompt):
+async def generate_post_text(user_prompt):
     try:
         for _ in range(5):
             response = client.chat.completions.create(
@@ -111,11 +112,11 @@ def generate_post_text(user_prompt):
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt}
                 ],
-                max_tokens=300,  # Жёсткий лимит: ~990 символов
-                temperature=0.7  # Добавь, чтобы текст был креативным, но кратким
+                max_tokens=300,
+                temperature=0.7
             )
             content = response.choices[0].message.content.strip().replace("###", "")
-            if len(content) <= 1015:  # Валидация
+            if len(content) <= 1015:
                 return content
         logger.warning("⚠️ GPT не смог уложиться в лимит.")
         return None
@@ -123,8 +124,7 @@ def generate_post_text(user_prompt):
         logger.error(f"Ошибка генерации текста: {e}")
         return None
 
-# Генерация изображений
-def generate_image(title_line, style="news"):
+async def generate_image(title_line, style="news"):
     try:
         stripped_title = title_line.strip('📊📈📉💰🏦💸🧠📌').strip()
         if style == "rubric":
@@ -153,23 +153,21 @@ def generate_image(title_line, style="news"):
         logger.error(f"Ошибка генерации изображения: {e}")
         return None
 
-# Публикация поста
-def publish_post(content, image_url):
+async def publish_post(content, image_url):
     try:
         if len(content) > 1024:
             content = content[:1020] + "..."
-        bot.send_photo(
+        await bot.send_photo(
             chat_id=CHANNEL_ID,
             photo=image_url,
             caption=content,
-            parse_mode=telegram.constants.ParseMode.MARKDOWN_V2  # Исправлено
+            parse_mode=telegram.constants.ParseMode.MARKDOWN_V2
         )
         logger.info("✅ Пост опубликован!")
     except Exception as e:
         logger.error(f"Ошибка публикации: {e}")
 
-# Рубричный пост
-def scheduled_rubric_post():
+async def scheduled_rubric_post():
     state = load_state()
     rubric_index = state["rubric_index"]
     rubric = rubrics[rubric_index]
@@ -178,18 +176,17 @@ def scheduled_rubric_post():
     save_state(rubric_index, state["news_index"])
     logger.info(f"⏳ Генерация рубричного поста: {rubric}")
 
-    text = generate_post_text(f"Создай структурированный и интересный Telegram-пост по рубрике: {rubric}.")
+    text = await generate_post_text(f"Создай структурированный и интересный Telegram-пост по рубрике: {rubric}.")
     if text:
         title_line = next(
             (line for line in text.split('\n') if line.strip().startswith(('📊', '📈', '📉', '💰', '🏦', '💸', '🧠', '📌'))),
             text.split('\n')[0]
         )
-        image_url = generate_image(title_line, style="rubric")
+        image_url = await generate_image(title_line, style="rubric")
         if image_url:
-            publish_post(text, image_url)
+            await publish_post(text, image_url)
 
-# Новостной пост
-def fetch_top_rss_news(rubric_name):
+async def fetch_top_rss_news(rubric_name):
     feeds = rss_sources.get(rubric_name, [])
     for url in feeds:
         try:
@@ -203,7 +200,7 @@ def fetch_top_rss_news(rubric_name):
             logger.error(f"Ошибка при парсинге RSS {url}: {e}")
     return "Нет актуальных новостей по теме."
 
-def scheduled_news_post():
+async def scheduled_news_post():
     state = load_state()
     news_index = state["news_index"]
     topic = news_themes[news_index]
@@ -213,7 +210,7 @@ def scheduled_news_post():
     today = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%-d %B %Y")
     logger.info(f"⏳ Генерация новостного поста: {topic}")
 
-    rss_news = fetch_top_rss_news(topic)
+    rss_news = await asyncio.to_thread(fetch_top_rss_news, topic)  # Асинхронный вызов синхронной функции
     if len(rss_news) > 500:
         rss_news = rss_news[:500] + "..."
     user_prompt = (
@@ -221,15 +218,15 @@ def scheduled_news_post():
         f"Дата: {today}. Содержание новости: {rss_news}. "
         f"Сделай пост живым, структурным, не более 990 символов. Вставь подзаголовок-зацеп. В конце — вопрос подписчику."
     )
-    text = generate_post_text(user_prompt)
+    text = await generate_post_text(user_prompt)
     if text:
         title_line = next(
             (line for line in text.split('\n') if line.strip().startswith(('📊', '📈', '📉', '💰', '🏦', '💸', '🧠', '📌'))),
             text.split('\n')[0]
         )
-        image_url = generate_image(title_line, style="news")
+        image_url = await generate_image(title_line, style="news")
         if image_url:
-            publish_post(text, image_url)
+            await publish_post(text, image_url)
 
 # Расписание (МСК)
 scheduler.add_job(scheduled_news_post, 'cron', hour=9, minute=16)
@@ -237,16 +234,19 @@ scheduler.add_job(scheduled_rubric_post, 'cron', hour=11, minute=42)
 scheduler.add_job(scheduled_news_post, 'cron', hour=13, minute=24)
 scheduler.add_job(scheduled_rubric_post, 'cron', hour=16, minute=5)
 scheduler.add_job(scheduled_news_post, 'cron', hour=18, minute=47)
-scheduler.add_job(scheduled_rubric_post, 'cron', hour=19, minute=47)
+scheduler.add_job(scheduled_rubric_post, 'cron', hour=20, minute=30)
 
-if __name__ == "__main__":
+async def main():
     logger.info("Запуск бота...")
     scheduled_rubric_post()
     scheduler.start()
     try:
         while True:
-            pass  # Держим процесс активным
+            await asyncio.sleep(60)  # Sleep 1 мин, чтобы не нагружать CPU
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 # Тестовые посты. Выше - scheduler.start() нужно вставить: Тестовый рубричный пост: scheduled_rubric_post()   Тестовый новостной пост: scheduled_news_post()
