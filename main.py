@@ -151,7 +151,7 @@ def publish_post(content, image_url):
             chat_id=CHANNEL_ID,
             photo=image_url,
             caption=content,
-            parse_mode=telegram.ParseMode.MARKDOWN
+            parse_mode=telegram.constants.ParseMode.MARKDOWN_V2  # Исправлено
         )
         logger.info("✅ Пост опубликован!")
     except Exception as e:
