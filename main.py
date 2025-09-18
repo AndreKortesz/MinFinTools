@@ -239,7 +239,7 @@ async def main():
     await app.updater.start_polling(drop_pending_updates=True)
 
     logger.info("Бот запущен. Выполняю тестовый пост...")
-    await scheduled_rubric_post(ContextTypes.DEFAULT_TYPE(bot=app.bot))
+    await scheduled_rubric_post(None)  # Используем None вместо ContextTypes.DEFAULT_TYPE
 
     # Бесконечный цикл для поддержки
     try:
