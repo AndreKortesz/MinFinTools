@@ -1,9 +1,9 @@
 import os
 import json
 import logging
-import telegram
 from openai import OpenAI
-from apscheduler.schedulers.async_ import AsyncScheduler
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from datetime import datetime
 import pytz
 import feedparser
@@ -23,8 +23,6 @@ logger = logging.getLogger(__name__)
 
 # Инициализация клиентов
 client = OpenAI(api_key=OPENAI_API_KEY)
-bot = telegram.Bot(token=TELEGRAM_TOKEN)
-scheduler = AsyncScheduler(timezone=pytz.timezone("Europe/Moscow"))
 
 # Список рубрик и новостных тем
 rubrics = [
@@ -153,11 +151,11 @@ async def generate_image(title_line, style="news"):
         logger.error(f"Ошибка генерации изображения: {e}")
         return None
 
-async def publish_post(content, image_url):
+async def publish_post(content, image_url, application):
     try:
         if len(content) > 1024:
             content = content[:1020] + "..."
-        await bot.send_photo(
+        await application.bot.send_photo(
             chat_id=CHANNEL_ID,
             photo=image_url,
             caption=content,
@@ -167,7 +165,7 @@ async def publish_post(content, image_url):
     except Exception as e:
         logger.error(f"Ошибка публикации: {e}")
 
-async def scheduled_rubric_post():
+async def scheduled_rubric_post(context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     rubric_index = state["rubric_index"]
     rubric = rubrics[rubric_index]
@@ -184,7 +182,7 @@ async def scheduled_rubric_post():
         )
         image_url = await generate_image(title_line, style="rubric")
         if image_url:
-            await publish_post(text, image_url)
+            await publish_post(text, image_url, context.application)
 
 async def fetch_top_rss_news(rubric_name):
     feeds = rss_sources.get(rubric_name, [])
@@ -200,7 +198,7 @@ async def fetch_top_rss_news(rubric_name):
             logger.error(f"Ошибка при парсинге RSS {url}: {e}")
     return "Нет актуальных новостей по теме."
 
-async def scheduled_news_post():
+async def scheduled_news_post(context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     news_index = state["news_index"]
     topic = news_themes[news_index]
@@ -210,7 +208,7 @@ async def scheduled_news_post():
     today = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%-d %B %Y")
     logger.info(f"⏳ Генерация новостного поста: {topic}")
 
-    rss_news = await asyncio.to_thread(fetch_top_rss_news, topic)  # Асинхронный вызов синхронной функции
+    rss_news = await asyncio.to_thread(fetch_top_rss_news, topic)
     if len(rss_news) > 500:
         rss_news = rss_news[:500] + "..."
     user_prompt = (
@@ -226,27 +224,22 @@ async def scheduled_news_post():
         )
         image_url = await generate_image(title_line, style="news")
         if image_url:
-            await publish_post(text, image_url)
+            await publish_post(text, image_url, context.application)
 
-# Расписание (МСК)
-scheduler.add_job(scheduled_news_post, 'cron', hour=9, minute=16)
-scheduler.add_job(scheduled_rubric_post, 'cron', hour=11, minute=42)
-scheduler.add_job(scheduled_news_post, 'cron', hour=13, minute=24)
-scheduler.add_job(scheduled_rubric_post, 'cron', hour=16, minute=5)
-scheduler.add_job(scheduled_news_post, 'cron', hour=18, minute=47)
-scheduler.add_job(scheduled_rubric_post, 'cron', hour=20, minute=30)
+def main():
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-async def main():
-    logger.info("Запуск бота...")
-    scheduled_rubric_post()
-    scheduler.start()
-    try:
-        while True:
-            await asyncio.sleep(60)  # Sleep 1 мин, чтобы не нагружать CPU
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+    # Расписание (МСК)
+    application.job_queue.run_daily(scheduled_news_post, time=datetime.time(hour=9, minute=16, tzinfo=pytz.timezone("Europe/Moscow")))
+    application.job_queue.run_daily(scheduled_rubric_post, time=datetime.time(hour=11, minute=42, tzinfo=pytz.timezone("Europe/Moscow")))
+    application.job_queue.run_daily(scheduled_news_post, time=datetime.time(hour=13, minute=24, tzinfo=pytz.timezone("Europe/Moscow")))
+    application.job_queue.run_daily(scheduled_rubric_post, time=datetime.time(hour=16, minute=5, tzinfo=pytz.timezone("Europe/Moscow")))
+    application.job_queue.run_daily(scheduled_news_post, time=datetime.time(hour=18, minute=47, tzinfo=pytz.timezone("Europe/Moscow")))
+    application.job_queue.run_daily(scheduled_rubric_post, time=datetime.time(hour=20, minute=30, tzinfo=pytz.timezone("Europe/Moscow")))
+
+    # Запуск
+    asyncio.run(scheduled_rubric_post(None))  # None как placeholder для context
+    application.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
-# Тестовые посты. Выше - scheduler.start() нужно вставить: Тестовый рубричный пост: scheduled_rubric_post()   Тестовый новостной пост: scheduled_news_post()
+    main()
