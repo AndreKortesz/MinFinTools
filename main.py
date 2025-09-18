@@ -230,9 +230,12 @@ scheduler.add_job(scheduled_rubric_post, 'cron', hour=19, minute=47)
 
 if __name__ == "__main__":
     logger.info("Запуск бота...")
+    scheduled_rubric_post()
     scheduler.start()
     try:
         while True:
             pass  # Держим процесс активным
     except (KeyboardInterrupt, SystemExit):
         scheduler.shutdown()
+
+# Тестовые посты. Выше - scheduler.start() нужно вставить: Тестовый рубричный пост: scheduled_rubric_post()   Тестовый новостной пост: scheduled_news_post()
