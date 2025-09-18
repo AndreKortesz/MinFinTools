@@ -9,6 +9,7 @@ import pytz
 import feedparser
 import re
 from dotenv import load_dotenv
+import httpx  # Для явного управления HTTP-клиентом
 
 # Загрузка env
 load_dotenv()
@@ -20,8 +21,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Инициализация клиентов
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Инициализация клиента OpenAI с явным HTTP-клиентом без прокси
+http_client = httpx.Client(proxies=None)  # Явно отключаем прокси
+client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
 # Список рубрик и новостных тем
 rubrics = [
@@ -193,10 +195,15 @@ async def scheduled_news_post(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%-d %B %Y")
     logger.info(f"⏳ Генерация новостного поста: {topic}")
 
-    rss_news = clean_html(feedparser.parse(rss_sources[topic][0]).entries[0].summary if feedparser.parse(rss_sources[topic][0]).entries else "Нет новостей")
+    rss_feed = feedparser.parse(rss_sources[topic][0])  # Берем первый источник
+    rss_news = clean_html(rss_feed.entries[0].summary) if rss_feed.entries else "Нет актуальных новостей"
     if len(rss_news) > 500:
         rss_news = rss_news[:500] + "..."
-    user_prompt = f"Составь актуальный Telegram-пост по теме: {topic}. Дата: {today}. Содержание новости: {rss_news}. Сделай пост живым, структурным, не более 990 символов. Вставь подзаголовок-зацеп. В конце — вопрос подписчику."
+    user_prompt = (
+        f"Составь актуальный Telegram-пост по теме: {topic}. "
+        f"Дата: {today}. Содержание новости: {rss_news}. "
+        f"Сделай пост живым, структурным, не более 990 символов. Вставь подзаголовок-зацеп. В конце — вопрос подписчику."
+    )
     text = await generate_post_text(user_prompt)
     if text:
         title_line = next(
@@ -210,7 +217,7 @@ async def scheduled_news_post(context: ContextTypes.DEFAULT_TYPE):
 async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Расписание
+    # Расписание (МСК)
     app.job_queue.run_daily(scheduled_news_post, time=time(9, 16, tzinfo=pytz.timezone("Europe/Moscow")))
     app.job_queue.run_daily(scheduled_rubric_post, time=time(11, 42, tzinfo=pytz.timezone("Europe/Moscow")))
     app.job_queue.run_daily(scheduled_news_post, time=time(13, 24, tzinfo=pytz.timezone("Europe/Moscow")))
@@ -218,15 +225,15 @@ async def main():
     app.job_queue.run_daily(scheduled_news_post, time=time(18, 47, tzinfo=pytz.timezone("Europe/Moscow")))
     app.job_queue.run_daily(scheduled_rubric_post, time=time(20, 30, tzinfo=pytz.timezone("Europe/Moscow")))
 
-    # Инициализация и тест
+    # Инициализация и запуск
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
+    await app.updater.start_polling(drop_pending_updates=True)
 
     logger.info("Бот запущен. Выполняю тестовый пост...")
     await scheduled_rubric_post(ContextTypes.DEFAULT_TYPE(bot=app.bot))
 
-    # Бесконечный цикл
+    # Бесконечный цикл для поддержки
     try:
         while True:
             await asyncio.sleep(60)
