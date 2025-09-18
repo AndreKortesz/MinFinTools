@@ -19,7 +19,7 @@ def ping():
 @app.route("/test")
 def manual_test():
     try:
-        test_news_post()
+        test_news_post("Финансовые новости России")
         return "✅ Тестовый пост отправлен!", 200
     except Exception as e:
         return f"❌ Ошибка: {e}", 500
