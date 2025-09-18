@@ -2,8 +2,7 @@ import os
 import json
 import logging
 import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, ContextTypes
 from openai import OpenAI
 from datetime import datetime, time
 import pytz
@@ -24,7 +23,7 @@ logger = logging.getLogger(__name__)
 # Инициализация клиентов
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Список рубрик и новостных тем (твои оригинальные)
+# Список рубрик и новостных тем
 rubrics = [
     "Финсовет дня", "Финликбез", "Личный финменеджмент", "Деньги в цифрах",
     "Кейс / Разбор", "Психология денег", "Финансовая ошибка", "Продукт недели",
@@ -69,7 +68,7 @@ def clean_html(raw_html):
     cleanr = re.compile('<.*?>')
     return re.sub(cleanr, '', raw_html)
 
-# Промпт для GPT (твой улучшенный с лимитом)
+# Промпт для GPT
 SYSTEM_PROMPT = (
     "Ты — финансовый редактор Telegram-канала. Пиши живо, структурно и современно. "
     "Пост обязательно должен включать следующие блоки: "
@@ -151,11 +150,11 @@ async def generate_image(title_line, style="news"):
         logger.error(f"Ошибка генерации изображения: {e}")
         return None
 
-async def publish_post(content, image_url):
+async def publish_post(content, image_url, bot):
     try:
         if len(content) > 1024:
             content = content[:1020] + "..."
-        await application.bot.send_photo(
+        await bot.send_photo(
             chat_id=CHANNEL_ID,
             photo=image_url,
             caption=content,
@@ -165,7 +164,6 @@ async def publish_post(content, image_url):
     except Exception as e:
         logger.error(f"Ошибка публикации: {e}")
 
-# Рубричный пост (асинхронный)
 async def scheduled_rubric_post(context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     rubric_index = state["rubric_index"]
@@ -183,22 +181,7 @@ async def scheduled_rubric_post(context: ContextTypes.DEFAULT_TYPE):
         )
         image_url = await generate_image(title_line, style="rubric")
         if image_url:
-            await publish_post(text, image_url)
-
-# Новостной пост (асинхронный)
-async def fetch_top_rss_news(rubric_name):
-    feeds = rss_sources.get(rubric_name, [])
-    for url in feeds:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries:
-                title = entry.title
-                summary = clean_html(entry.get("summary", ""))
-                if len(summary) > 50:
-                    return f"{title}: {summary}"
-        except Exception as e:
-            logger.error(f"Ошибка при парсинге RSS {url}: {e}")
-    return "Нет актуальных новостей по теме."
+            await publish_post(text, image_url, context.bot)
 
 async def scheduled_news_post(context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
@@ -210,15 +193,10 @@ async def scheduled_news_post(context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%-d %B %Y")
     logger.info(f"⏳ Генерация новостного поста: {topic}")
 
-    loop = asyncio.get_event_loop()
-    rss_news = await loop.run_in_executor(None, fetch_top_rss_news, topic)
+    rss_news = clean_html(feedparser.parse(rss_sources[topic][0]).entries[0].summary if feedparser.parse(rss_sources[topic][0]).entries else "Нет новостей")
     if len(rss_news) > 500:
         rss_news = rss_news[:500] + "..."
-    user_prompt = (
-        f"Составь актуальный Telegram-пост по теме: {topic}. "
-        f"Дата: {today}. Содержание новости: {rss_news}. "
-        f"Сделай пост живым, структурным, не более 990 символов. Вставь подзаголовок-зацеп. В конце — вопрос подписчику."
-    )
+    user_prompt = f"Составь актуальный Telegram-пост по теме: {topic}. Дата: {today}. Содержание новости: {rss_news}. Сделай пост живым, структурным, не более 990 символов. Вставь подзаголовок-зацеп. В конце — вопрос подписчику."
     text = await generate_post_text(user_prompt)
     if text:
         title_line = next(
@@ -227,43 +205,35 @@ async def scheduled_news_post(context: ContextTypes.DEFAULT_TYPE):
         )
         image_url = await generate_image(title_line, style="news")
         if image_url:
-            await publish_post(text, image_url)
-
-# Глобальная переменная для application (для publish_post)
-application = None
+            await publish_post(text, image_url, context.bot)
 
 async def main():
-    global application
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Расписание (МСК) — твои времена
-    msk_tz = pytz.timezone("Europe/Moscow")
-    application.job_queue.run_daily(scheduled_news_post, time=time(9, 16, tzinfo=msk_tz))
-    application.job_queue.run_daily(scheduled_rubric_post, time=time(11, 42, tzinfo=msk_tz))
-    application.job_queue.run_daily(scheduled_news_post, time=time(13, 24, tzinfo=msk_tz))
-    application.job_queue.run_daily(scheduled_rubric_post, time=time(16, 5, tzinfo=msk_tz))
-    application.job_queue.run_daily(scheduled_news_post, time=time(18, 47, tzinfo=msk_tz))
-    application.job_queue.run_daily(scheduled_rubric_post, time=time(20, 30, tzinfo=msk_tz))
+    # Расписание
+    app.job_queue.run_daily(scheduled_news_post, time=time(9, 16, tzinfo=pytz.timezone("Europe/Moscow")))
+    app.job_queue.run_daily(scheduled_rubric_post, time=time(11, 42, tzinfo=pytz.timezone("Europe/Moscow")))
+    app.job_queue.run_daily(scheduled_news_post, time=time(13, 24, tzinfo=pytz.timezone("Europe/Moscow")))
+    app.job_queue.run_daily(scheduled_rubric_post, time=time(16, 5, tzinfo=pytz.timezone("Europe/Moscow")))
+    app.job_queue.run_daily(scheduled_news_post, time=time(18, 47, tzinfo=pytz.timezone("Europe/Moscow")))
+    app.job_queue.run_daily(scheduled_rubric_post, time=time(20, 30, tzinfo=pytz.timezone("Europe/Moscow")))
 
-    # Инициализация
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
+    # Инициализация и тест
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
 
-    logger.info("Бот запущен и polling активен. Ждём расписания...")
+    logger.info("Бот запущен. Выполняю тестовый пост...")
+    await scheduled_rubric_post(ContextTypes.DEFAULT_TYPE(bot=app.bot))
 
-    # ТЕСТОВЫЙ ПОСТ: Запускаем асинхронно в event loop
-    await scheduled_rubric_post(None)  # None как placeholder
-
-    # Бесконечный цикл для поддержания (polling уже работает)
+    # Бесконечный цикл
     try:
         while True:
-            await asyncio.sleep(60)  # Sleep, чтобы не нагружать CPU
+            await asyncio.sleep(60)
     except KeyboardInterrupt:
-        logger.info("Остановка бота...")
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
