@@ -293,67 +293,53 @@ def generate_image(title_line, style="news"):
     try:
         stripped_title = title_line.strip('📊📈📉💰🏦💸🧠📌').strip()
 
-        lenses = ["85mm lens", "50mm prime", "35mm documentary", "macro close-up"]
-        lights = ["soft studio lighting", "global illumination", "volumetric light", "rim light"]
-        looks  = ["photorealistic PBR materials", "cinematic grade", "ray-traced reflections", "high microdetail"]
+        # вариативность, чтобы картинки не повторялись
+        lenses  = ["85mm lens", "50mm prime", "35mm wide", "telephoto compression"]
+        cameras = ["three-quarters view", "low-angle hero shot", "top-down minimal", "isometric semi-orthographic"]
+        lights  = ["global illumination", "soft studio lighting", "volumetric light", "rim light, subtle bloom"]
+        moods   = ["optimistic growth", "tense volatility", "calm stability", "cautious uncertainty", "analytical, high-tech"]
+        envs    = [
+            "sleek trading desk with glass surfaces",
+            "abstract city skyline of a financial district",
+            "clean studio with floating glass charts",
+            "minimal architectural space with columns",
+            "macro world of money props (paper, metal, glass) without text"
+        ]
+        devices = [
+            "subtle wavy glass charts (volatility)",
+            "gradually rising geometric bars (growth)",
+            "balancing scales or counterweights (risk)",
+            "interlocking blocks (diversification)",
+            "flowing liquid glass shapes (liquidity)",
+            "soft bokeh particles and thin market grid lines"
+        ]
+
+        # общая формулировка — сюжетная сцена по смыслу заголовка
+        base_prompt = f"""
+            Create a premium, photorealistic 3D narrative scene (not a single centered emblem) that visually conveys
+            the meaning of the headline: “{stripped_title}”. Use believable PBR materials, ray-traced reflections,
+            depth of field and cinematic contrast. Environment: {random.choice(envs)}.
+            Camera: {random.choice(cameras)} with {random.choice(lenses)}.
+            Lighting: {random.choice(lights)}. Mood: {random.choice(moods)}.
+            Include 2–3 subtle visual metaphors appropriate to the headline, such as {', '.join(random.sample(devices, 3))}.
+            No people. Square 1:1. Clean composition, premium finance aesthetics.
+            Strictly no text, numbers or logos.
+        """
 
         if style == "rubric":
-            rubric_marks = [
-                "thin light border around the frame",
-                "subtle bookmark ribbon in the top-left (no text)",
-                "delicate dotted grid background pattern",
-                "soft halo ring behind the central object"
-            ]
-            prompt = f"""
-                Ultra-detailed 3D photorealistic CG render, {random.choice(lenses)}, {random.choice(lights)},
-                {random.choice(looks)}, clean studio composition, shallow depth of field.
-                Theme from the headline: “{stripped_title}”.
-                One clear central object that conveys the finance topic; realistic materials (metal, glass, paper, fabric).
-                Add rubric signatures: {', '.join(random.sample(rubric_marks, k=2))}.
-                Background slightly brighter than news covers. Balanced, minimal, premium.
-                Square 1:1. No people.
-            """
-            prompt += "\n" + NEGATIVE_SUFFIX
+            # рубричные — немного светлее и с аккуратным дизайн-акцентом
+            style_hint = (
+                "Slightly brighter neutral background, gentle studio feel. "
+                "Optionally a very subtle design accent (faint dotted grid or thin soft border), not distracting."
+            )
         else:
-            title_lc = stripped_title.lower()
-            central_by_kw = [
-                (("биткоин","bitcoin","btc","крипт"), "large realistic bitcoin coin"),
-                (("эфир","eth","ethereum"), "crystal-like ethereum symbol"),
-                (("нефть","brent","брент","wti","oil","баррель"), "metal oil barrel"),
-                (("золото","gold","xau"), "gold bullion bar"),
-                (("рубль","rub","₽"), "ruble sign sculpted in metal"),
-                (("доллар","usd","$","фрс","ставка фрс"), "dollar sign sculpted in metal"),
-                (("евро","eur","€","ецб"), "euro sign sculpted in metal"),
-                (("облигац","офз","доходност","купон","yields"), "real bond coupon sheet"),
-                (("акци","ipo","etf","индекс","s&p","моэкс","nasdaq","dow"), "glass candlestick chart sculpture"),
-                (("инфляц","cpi","pce","цен","ставк","ключев"), "pressure gauge instrument"),
-                (("банк","кредит","депозит","ипотек"), "bank facade with columns (miniature)"),
-                (("санкц","экспорт","импорт","торгов"), "cargo containers stack"),
-            ]
-            central = "premium abstract financial sculpture"
-            for keys, obj in central_by_kw:
-                if any(k in title_lc for k in keys):
-                    central = obj
-                    break
+            # новости — темнее, динамичнее
+            style_hint = (
+                "Darker premium background and a more dynamic overall composition. "
+                "Keep it tasteful and realistic."
+            )
 
-            compositions = [
-                "dynamic diagonal composition",
-                "rule-of-thirds composition",
-                "isometric product shot",
-                "low-angle hero shot",
-            ]
-            details = random.sample([
-                "tiny scattered coins", "thin market grid lines", "soft bokeh particles",
-                "mini tickers as abstract bars", "glass shards like price bars"
-            ], k=2)
-
-            prompt = f"""
-                Ultra-detailed 3D photorealistic CG render, {random.choice(lenses)}, {random.choice(lights)},
-                {random.choice(looks)}, {random.choice(compositions)}, cinematic contrast.
-                Central object: {central}. Around it: {', '.join(details)}.
-                Darker premium background; clean, realistic, no noise. Square 1:1. No people.
-            """
-            prompt += "\n" + NEGATIVE_SUFFIX
+        prompt = base_prompt + "\n" + style_hint + "\n" + NEGATIVE_SUFFIX
 
         response = client.images.generate(
             model="dall-e-3",
