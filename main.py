@@ -16,11 +16,21 @@ def home():
 def ping():
     return "OK", 200
 
+from flask import request
+
 @app.route("/test")
 def manual_test():
+
+    kind = request.args.get("type", "news")   # "news" или "rubric"
     try:
-        test_news_post("Финансовые новости России")
-        return "✅ Тестовый пост отправлен!", 200
+        if kind == "rubric":
+            # публикует СЛЕДУЮЩУЮ рубрику по ротации (двигает rubric_index)
+            scheduled_rubric_post()
+            return "✅ Отправлен следующий рубричный пост по ротации", 200
+        else:
+            # публикует СЛЕДУЮЩУЮ новостную тему по ротации (двигает news_index)
+            scheduled_news_post()
+            return "✅ Отправлен следующий новостной пост по ротации", 200
     except Exception as e:
         return f"❌ Ошибка: {e}", 500
 
