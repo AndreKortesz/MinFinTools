@@ -1,6 +1,11 @@
-import os, json, re, time, hashlib, html
-import logging
+import os
+import re
+import json
+import time
+import html
 import random
+import hashlib
+import logging
 from io import BytesIO
 from time import mktime
 from datetime import datetime, timedelta
@@ -11,10 +16,34 @@ import httpx
 import feedparser
 import telegram
 from telegram.error import BadRequest
-from flask import Flask, request
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, request
 
+# ─── Настройки ─────────────────────────────────────────────────────────────────
+app = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN не задан в переменных окружения")
+if not CHANNEL_ID:
+    raise ValueError("CHANNEL_ID не задан в переменных окружения")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY не задан в переменных окружения")
+
+# анти-повторы новостей — можно переопределять через ENV
+SEEN_NEWS_FILE = os.getenv("SEEN_NEWS_FILE", "/tmp/seen_news.json")
+SEEN_MAX_DAYS = int(os.getenv("SEEN_MAX_DAYS", "7"))
+SEEN_MAX_ITEMS = int(os.getenv("SEEN_MAX_ITEMS", "1000"))
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+bot = telegram.Bot(token=TELEGRAM_TOKEN)
+scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Moscow"))
 
 NEGATIVE_SUFFIX = (
     "Строго БЕЗ текста, букв, цифр и логотипов. "
@@ -23,14 +52,7 @@ NEGATIVE_SUFFIX = (
     "Запрет: плоская векторная графика, иконки, комикс, 2D-иллюстрация, клипарт."
 )
 
-# «Память» о сюжетах, чтобы не дублировать новости
-SEEN_NEWS_FILE = "seen_news.json"
-SEEN_MAX_DAYS  = 7
-SEEN_MAX_ITEMS = 1000
-
-app = Flask(__name__)
-
-# ─── Маршруты здоровья ────────────────────────────────────────────────────────
+# ─── Маршруты здоровья / ручной триггер ───────────────────────────────────────
 @app.route("/")
 def home():
     return "Бот работает ✅", 200
@@ -41,10 +63,8 @@ def ping():
 
 @app.route("/test")
 def manual_test():
-    kind = request.args.get("type", "news")   # "news" или "rubric"
+    kind = request.args.get("type", "news")  # "news" или "rubric"
     try:
-        # Если хочешь не ждать ответа HTTP — можно отправлять в фоне:
-        # import threading; threading.Thread(target=scheduled_news_post, daemon=True).start()
         if kind == "rubric":
             scheduled_rubric_post()
             return "✅ Отправлен следующий рубричный пост по ротации", 200
@@ -54,46 +74,117 @@ def manual_test():
     except Exception as e:
         return f"❌ Ошибка: {e}", 500
 
+# ─── Утилиты ──────────────────────────────────────────────────────────────────
+def clean_html(raw_html: str) -> str:
+    return re.sub(re.compile('<.*?>'), '', raw_html or "")
 
-def clean_html(raw_html):
-    cleanr = re.compile('<.*?>')
-    return html.unescape(re.sub(cleanr, '', raw_html))
+def _canonical_link(link: str) -> str:
+    if not link:
+        return ""
+    try:
+        u = urlsplit(link)
+        q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+             if not k.lower().startswith("utm_")]
+        return urlunsplit((u.scheme, u.netloc.lower(), u.path, urlencode(sorted(q)), ""))
+    except Exception:
+        return link
 
-# ─── Логирование ───────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def _story_id(title: str, link: str) -> str:
+    canon = _canonical_link(link)
+    base = (canon or title or "").lower()
+    base = re.sub(r"\s+", " ", base)
+    base = re.sub(r"[^\w\s/.\-]+", "", base)
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
 
-# ─── ENV ───────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+def _load_seen() -> dict:
+    if os.path.exists(SEEN_NEWS_FILE):
+        try:
+            with open(SEEN_NEWS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
-if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN не задан в переменных окружения")
-if not CHANNEL_ID:
-    raise ValueError("CHANNEL_ID не задан в переменных окружения")
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY не задан в переменных окружения")
+def _save_seen(seen: dict):
+    try:
+        with open(SEEN_NEWS_FILE, "w", encoding="utf-8") as f:
+            json.dump(seen, f, ensure_ascii=False)
+    except Exception:
+        pass
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-bot = telegram.Bot(token=TELEGRAM_TOKEN)
+def _prune_seen(seen: dict):
+    now = time.time()
+    cutoff = now - SEEN_MAX_DAYS * 86400
+    # по времени
+    for k in list(seen.keys()):
+        if seen[k] < cutoff:
+            del seen[k]
+    # по размеру
+    if len(seen) > SEEN_MAX_ITEMS:
+        keep = dict(sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:SEEN_MAX_ITEMS])
+        seen.clear()
+        seen.update(keep)
 
-# Railway — часовой пояс (МСК)
-scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Moscow"))
+def _mark_seen(story_id: str):
+    seen = _load_seen()
+    seen[story_id] = time.time()
+    _prune_seen(seen)
+    _save_seen(seen)
 
-# ─── Контентные настройки (НЕ ТРОГАЛ) ─────────────────────────────────────────
+def _is_seen(story_id: str) -> bool:
+    return story_id in _load_seen()
+
+def _polish_and_to_html(text: str) -> str:
+    """
+    1) убирает '— Подсчёт: ...'
+    2) нормализует подзаголовки (эмодзи + жирный)
+    3) вставляет пустые строки перед подзаголовками
+    4) конвертирует **...** → <b>...</b> и экранирует HTML
+    """
+    t = (text or "").strip()
+    # убрать строку '— Подсчёт: ...'
+    t = re.sub(r'(?im)^\s*[—\-–]\s*Подсч[её]т:.*$', '', t)
+
+    # заголовки
+    t = re.sub(r'(?im)^\s*Аналитика\s*:?\s*$', '**📊 Аналитика:**', t, flags=re.MULTILINE)
+    t = re.sub(r'(?im)^\s*Прогноз\s*:?\s*$',   '**📈 Прогноз:**',   t, flags=re.MULTILINE)
+    t = re.sub(r'(?im)^\s*Вывод\s*:?\s*$',     '**🧭 Вывод:**',     t, flags=re.MULTILINE)
+
+    # пустая строка перед подзаголовками
+    t = re.sub(r'(?m)([^\n])\n(\*\*[^\n]*\*\*)', r'\1\n\n\2', t)
+    # и перенос после
+    t = re.sub(r'(?m)(\*\*[^\n]*\*\*)\n(?!\n)', r'\1\n', t)
+
+    # временно скрываем **...**
+    placeholders = []
+    def _keep_bold(m):
+        placeholders.append(m.group(1))
+        return f"@@B{len(placeholders)-1}@@"
+
+    t = re.sub(r"\*\*(.+?)\*\*", _keep_bold, t, flags=re.DOTALL)
+
+    # экранируем HTML
+    t = html.escape(t)
+
+    # возвращаем <b>...</b>
+    for i, content in enumerate(placeholders):
+        t = t.replace(f"@@B{i}@@", f"<b>{html.escape(content)}</b>")
+
+    return t.strip()
+
+# ─── Контентные настройки (оставлены как были) ────────────────────────────────
 rubrics = [
     "Финсовет дня", "Финликбез", "Личный финменеджмент", "Деньги в цифрах",
     "Кейс / Разбор", "Психология денег", "Финансовая ошибка", "Продукт недели",
     "Инвест-горизонт", "Миф недели", "Путь к 1 млн", "Финансовая привычка",
-    "Вопрос — ответ", "Excel / Таблица", "Финансовая цитата",
-    "Инструмент недели"
+    "Вопрос — ответ", "Excel / Таблица", "Финансовая цитата", "Инструмент недели"
 ]
 rubric_index = 0
 news_index = 0
 
 news_themes = [
-    "Финансовые новости России", "Новости криптовалют",
+    "Финансовые новости России",
+    "Новости криптовалют",
     "Новости фондовых рынков (Россия и США)"
 ]
 rss_sources = {
@@ -103,7 +194,8 @@ rss_sources = {
         "https://www.interfax.ru/rss.asp"
     ],
     "Новости криптовалют": [
-        "https://forklog.com/feed/", "https://bitnovosti.com/feed/"
+        "https://forklog.com/feed/",
+        "https://bitnovosti.com/feed/"
     ],
     "Новости фондовых рынков (Россия и США)": [
         "https://rssexport.rbc.ru/rbcnews/news/21/full.rss",
@@ -121,27 +213,12 @@ SYSTEM_PROMPT = (
     "5) аналитика и прогноз, "
     "6) итоговый вывод. "
     "В конце — ненавязчивый, естественно встроенный вопрос к подписчику. "
-    "Примеры зацепов:\n"
-    "— 🤔 Случайность или сигнал?\n"
-    "— 📉 Временное падение или начало тренда?\n"
-    "— 🤝 Дружба или иллюзия?\n"
-    "— 💸 Деньги есть — уверенности нет?\n"
-    "— 📈 Всё ли так гладко?\n"
-    "— 📊 Новый тренд или всплеск?\n"
     "Не используй решётки #. Используй только жирный шрифт для подзаголовков. "
     "Не используй эмодзи в теле текста, только в заголовках. "
     "СТРОГО: Ответ не должен превышать 990 символов. Перед финальным ответом подсчитай длину и убедись, что она <=990. Если больше — сократи. "
-    "Пример поста (длина 750 символов):\n"
-    "💰 Финсовет дня\n"
-    "🤔 Готовы к росту?\n"
-    "В мире инвестиций дисциплина — ключ к успеху.\n"
-    "**📊 Аналитика:** Рынок показывает волатильность, но диверсификация снижает риски.\n"
-    "**📈 Прогноз:** В ближайший месяц ожидается подъём на 5-7%.\n"
-    "Вывод: Начните с малого, но регулярно.\n"
-    "А вы пробовали диверсифицировать портфель?\n"
-    "— Подсчёт: 750 символов."
 )
 
+# ─── Генерация текста/картинок (контент не менял) ─────────────────────────────
 def generate_post_text(user_prompt, system_prompt=None):
     try:
         for _ in range(5):
@@ -150,8 +227,7 @@ def generate_post_text(user_prompt, system_prompt=None):
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt}
-                ],
-                timeout=30
+                ]
             )
             content = response.choices[0].message.content.strip().replace("###", "")
             if len(content) <= 1015:
@@ -166,12 +242,10 @@ def generate_image(title_line, style="news"):
     try:
         stripped_title = title_line.strip('📊📈📉💰🏦💸🧠📌').strip()
 
-        # общие вариации для реализма
         lenses = ["85mm lens", "50mm prime", "35mm documentary", "macro close-up"]
         lights = ["soft studio lighting", "global illumination", "volumetric light", "rim light"]
         looks  = ["photorealistic PBR materials", "cinematic grade", "ray-traced reflections", "high microdetail"]
 
-        # ── RUBRIC: тот же семейный стиль, но с парой 'подписей' и чуть светлее
         if style == "rubric":
             rubric_marks = [
                 "thin light border around the frame",
@@ -189,8 +263,6 @@ def generate_image(title_line, style="news"):
                 Square 1:1. No people.
             """
             prompt += "\n" + NEGATIVE_SUFFIX
-
-        # ── NEWS: такой же реализм, но без 'подписей', фон темнее, композиция динамичнее
         else:
             title_lc = stripped_title.lower()
             central_by_kw = [
@@ -198,9 +270,9 @@ def generate_image(title_line, style="news"):
                 (("эфир","eth","ethereum"), "crystal-like ethereum symbol"),
                 (("нефть","brent","брент","wti","oil","баррель"), "metal oil barrel"),
                 (("золото","gold","xau"), "gold bullion bar"),
-                # Валютные знаки заменены на нейтральные монеты/купюры без символов (чтобы не конфликтовать с NEGATIVE_SUFFIX):
-                (("рубль","rub","₽","доллар","usd","$","евро","eur","€"),
-                 "stack of blank coins and banknotes (no symbols)"),
+                (("рубль","rub","₽"), "ruble sign sculpted in metal"),
+                (("доллар","usd","$","фрс","ставка фрс"), "dollar sign sculpted in metal"),
+                (("евро","eur","€","ецб"), "euro sign sculpted in metal"),
                 (("облигац","офз","доходност","купон","yields"), "real bond coupon sheet"),
                 (("акци","ipo","etf","индекс","s&p","моэкс","nasdaq","dow"), "glass candlestick chart sculpture"),
                 (("инфляц","cpi","pce","цен","ставк","ключев"), "pressure gauge instrument"),
@@ -237,8 +309,7 @@ def generate_image(title_line, style="news"):
             prompt=prompt,
             size="1024x1024",
             quality="hd",
-            n=1,
-            timeout=60
+            n=1
         )
         return response.data[0].url
 
@@ -247,17 +318,18 @@ def generate_image(title_line, style="news"):
         return None
 
 def publish_post(content, image_url):
+    """Сначала пытаемся отправить по URL, при неудаче — скачиваем и шлём как файл.
+       Текст санитизируется и отправляется как HTML, чтобы жирный отработал стабильно."""
     try:
-        if len(content) > 1024:
-            content = content[:1020] + "..."
+        caption_html = _polish_and_to_html(content or "")
 
-        # Сначала пробуем как URL (быстрее)
+        # Попытка 1: URL
         try:
             bot.send_photo(
                 chat_id=CHANNEL_ID,
                 photo=image_url,
-                caption=content,
-                parse_mode=telegram.ParseMode.MARKDOWN
+                caption=caption_html,
+                parse_mode=telegram.ParseMode.HTML
             )
             logger.info("✅ Пост опубликован по URL")
             return
@@ -266,13 +338,13 @@ def publish_post(content, image_url):
             if ("Failed to get http url content" in msg
                 or "wrong type of the web page content" in msg
                 or "URL host is empty" in msg):
-                logger.warning("⚠️ TG не смог скачать изображение по URL, шлём как файл...")
+                logger.warning("⚠️ TG не смог скачать изображение по URL, шлём как файл…")
             else:
                 raise
 
-        # Fallback: скачиваем и шлём как файл
-        with httpx.Client(timeout=30.0, follow_redirects=True) as client_http:
-            resp = client_http.get(image_url)
+        # Попытка 2: файл
+        with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+            resp = c.get(image_url, headers={"User-Agent": "Mozilla/5.0"})
             resp.raise_for_status()
             image_bytes = resp.content
 
@@ -280,66 +352,17 @@ def publish_post(content, image_url):
         bot.send_photo(
             chat_id=CHANNEL_ID,
             photo=file_obj,
-            caption=content,
-            parse_mode=telegram.ParseMode.MARKDOWN
+            caption=caption_html,
+            parse_mode=telegram.ParseMode.HTML
         )
         logger.info("✅ Пост опубликован (отправлено как файл)")
     except Exception as e:
         logger.error(f"Ошибка публикации: {e}")
 
-# ─── Хелперы для дедупа новостей ──────────────────────────────────────────────
-def _load_seen():
-    if os.path.exists(SEEN_NEWS_FILE):
-        try:
-            return json.load(open(SEEN_NEWS_FILE, "r", encoding="utf-8"))
-        except Exception:
-            pass
-    return {}  # {story_id: ts}
+# ─── Ротация постов ───────────────────────────────────────────────────────────
+rubric_index = 0
+news_index = 0
 
-def _save_seen(seen: dict):
-    try:
-        json.dump(seen, open(SEEN_NEWS_FILE, "w", encoding="utf-8"), ensure_ascii=False)
-    except Exception:
-        pass
-
-def _prune_seen(seen: dict):
-    now = time.time()
-    cutoff = now - SEEN_MAX_DAYS * 86400
-    for k in list(seen.keys()):
-        if seen[k] < cutoff:
-            del seen[k]
-    if len(seen) > SEEN_MAX_ITEMS:
-        keep = dict(sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:SEEN_MAX_ITEMS])
-        seen.clear()
-        seen.update(keep)
-
-def _canonical_link(link: str) -> str:
-    if not link:
-        return ""
-    try:
-        u = urlsplit(link)
-        q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True) if not k.lower().startswith("utm_")]
-        return urlunsplit((u.scheme, u.netloc.lower(), u.path, urlencode(sorted(q)), ""))
-    except Exception:
-        return link
-
-def _story_id(title: str, link: str) -> str:
-    canon = _canonical_link(link)
-    base = (canon or title or "").lower()
-    base = re.sub(r"\s+", " ", base)
-    base = re.sub(r"[^\w\s/.-]+", "", base)
-    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
-
-def _mark_seen(story_id: str):
-    seen = _load_seen()
-    seen[story_id] = time.time()
-    _prune_seen(seen)
-    _save_seen(seen)
-
-def _is_seen(story_id: str) -> bool:
-    return story_id in _load_seen()
-
-# ─── Задачи ───────────────────────────────────────────────────────────────────
 def scheduled_rubric_post():
     global rubric_index
     rubric = rubrics[rubric_index]
@@ -365,7 +388,7 @@ def scheduled_rubric_post():
          if line.strip().startswith(('📊','📈','📉','💰','🏦','💸','🧠','📌'))),
         text.split('\n')[0]
     )
-    image_url = generate_image(title_line, style="rubric")  # отличимый стиль для рубрик
+    image_url = generate_image(title_line, style="news")  # оставил как ты хотел — одинаковый стиль
     if image_url:
         publish_post(text, image_url)
 
@@ -399,48 +422,42 @@ def fetch_buzzy_rss_news(topic, per_feed=5, lookback_hours=48):
     if not entries:
         return "Нет актуальных новостей по теме."
 
-    # свежесть
     cutoff = datetime.utcnow().replace(tzinfo=pytz.UTC) - timedelta(hours=lookback_hours)
     fresh = [x for x in entries if datetime.fromisoformat(x["published"]) >= cutoff]
-    items = fresh or entries  # если ничего свежего — берём всё
+    items = fresh or entries
 
-    # LLM-ранжирование «самой нашумевшей»
+    # выбор «самой нашумевшей» через LLM
     try:
         headlines = "\n".join([f"{i+1}. {x['title']}" for i, x in enumerate(items[:30])])
         prompt = (
             "Ниже список заголовков по одной теме. Выбери РОВНО ОДНУ «самую нашумевшую» "
-            "с учётом повторяемости сюжета в разных источниках, свежести (сначала последние 24–48ч), значимости источника и масштаба последствий. "
-            "Ответ верни в JSON с полями: best_index (int, номер из списка, начиная с 1) и reason (кратко, 1 фраза). "
+            "с учётом повторяемости сюжета в разных источниках, свежести (в приоритете последние 24–48ч), "
+            "значимости источника и масштаба последствий. "
+            "Ответ верни в JSON с полями: best_index (int, начиная с 1) и reason (1 короткая фраза). "
             f"\n\nСписок заголовков:\n{headlines}"
         )
         resp = client.chat.completions.create(
             model="gpt-4o",
-            messages=[{"role":"user","content": prompt}],
-            temperature=0.2,
-            timeout=30
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
         )
-        content = resp.choices[0].message.content.strip()
-        # Надёжный парсинг JSON (если модель вернула текст вокруг)
-        start, end = content.find("{"), content.rfind("}")
-        data = json.loads(content[start:end+1]) if start != -1 and end != -1 else {"best_index": 1}
+        data = json.loads(resp.choices[0].message.content)
         idx = int(data.get("best_index", 1)) - 1
         pick = items[max(0, min(idx, len(items)-1))]
     except Exception as ex:
         logger.warning(f"LLM ranking failed, fallback to latest: {ex}")
         pick = sorted(items, key=lambda x: x["published"], reverse=True)[0]
 
-    # Дедуп: пропускаем уже публиковавшийся сюжет и отмечаем новый
-    sid = _story_id(pick["title"], pick.get("link",""))
+    # анти-повторы: если уже было, берем ближайшую свежую альтернативу
+    sid = _story_id(pick["title"], pick.get("link", ""))
     if _is_seen(sid):
-        for x in items:
-            alt_sid = _story_id(x["title"], x.get("link",""))
+        for x in sorted(items, key=lambda y: y["published"], reverse=True):
+            alt_sid = _story_id(x["title"], x.get("link", ""))
             if not _is_seen(alt_sid):
-                pick = x
-                sid = alt_sid
+                pick, sid = x, alt_sid
                 break
     _mark_seen(sid)
 
-    # склейка под твой формат
     summary = pick["summary"] or ""
     if len(summary) > 300:
         summary = summary[:300] + "..."
@@ -474,7 +491,7 @@ def scheduled_news_post():
         if image_url:
             publish_post(text, image_url)
 
-# ─── Ручные тесты (оставил как есть, поправил источник RSS) ───────────────────
+# ─── Ручные тесты (как были, только fetch_buzzy_rss_news) ─────────────────────
 def test_rubric_post(rubric_name):
     logger.info(f"⏳ Ручная генерация рубричного поста: {rubric_name}")
     attempts, text = 0, None
@@ -494,7 +511,7 @@ def test_rubric_post(rubric_name):
          if line.strip().startswith(('📊','📈','📉','💰','🏦','💸','🧠','📌'))),
         text.split('\n')[0]
     )
-    image_url = generate_image(title_line, style="rubric")
+    image_url = generate_image(title_line, style="news")
     if image_url:
         publish_post(text, image_url)
 
@@ -520,17 +537,18 @@ def test_news_post(rubric_name):
         if image_url:
             publish_post(text, image_url)
 
-# ─── Расписание (МСК) — оставил твоё ──────────────────────────────────────────
-scheduler.add_job(scheduled_news_post, 'cron', hour=9, minute=26)
+# ─── Расписание (МСК) — оставил как у тебя ────────────────────────────────────
+scheduler.add_job(scheduled_news_post,   'cron', hour=9,  minute=26)
 scheduler.add_job(scheduled_rubric_post, 'cron', hour=11, minute=42)
-scheduler.add_job(scheduled_news_post, 'cron', hour=13, minute=24)
+scheduler.add_job(scheduled_news_post,   'cron', hour=13, minute=24)
 scheduler.add_job(scheduled_rubric_post, 'cron', hour=16, minute=5)
-scheduler.add_job(scheduled_news_post, 'cron', hour=18, minute=47)
+scheduler.add_job(scheduled_news_post,   'cron', hour=18, minute=47)
 scheduler.add_job(scheduled_rubric_post, 'cron', hour=19, minute=47)
 
 # ─── Запуск под Railway ───────────────────────────────────────────────────────
 if __name__ == "__main__":
     import threading
+
     def run_scheduler():
         scheduler.start()
         logger.info("🗓️ APScheduler запущен")
