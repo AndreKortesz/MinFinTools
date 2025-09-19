@@ -42,6 +42,9 @@ SEEN_NEWS_FILE = os.getenv("SEEN_NEWS_FILE", "/tmp/seen_news.json")
 SEEN_MAX_DAYS = int(os.getenv("SEEN_MAX_DAYS", "7"))
 SEEN_MAX_ITEMS = int(os.getenv("SEEN_MAX_ITEMS", "1000"))
 
+# файл состояния ротации (новое)
+ROTATION_STATE_FILE = os.getenv("ROTATION_STATE_FILE", "/tmp/rotation_state.json")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Moscow"))
@@ -181,6 +184,29 @@ def _polish_and_to_html(text: str) -> str:
         t = t.replace(f"@@B{i}@@", f"<b>{html.escape(content)}</b>")
 
     return t.strip()
+
+# ─── Персистентная ротация (новое) ────────────────────────────────────────────
+def _load_rotation_state():
+    try:
+        with open(ROTATION_STATE_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return {
+            "rubric_index": int(d.get("rubric_index", 0)),
+            "news_index":   int(d.get("news_index", 0)),
+        }
+    except Exception:
+        return {"rubric_index": 0, "news_index": 0}
+
+def _save_rotation_state(rubric_index: int, news_index: int):
+    data = {
+        "rubric_index": int(rubric_index),
+        "news_index":   int(news_index),
+        "ts":           time.time(),
+    }
+    tmp = ROTATION_STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, ROTATION_STATE_FILE)
 
 # ─── Контентные настройки (оставлены как были) ────────────────────────────────
 rubrics = [
@@ -401,14 +427,16 @@ def publish_post(content, image_url):
         logger.error(f"Ошибка публикации: {e}")
 
 # ─── Ротация постов ───────────────────────────────────────────────────────────
-rubric_index = 0
-news_index = 0
+_state = _load_rotation_state()
+rubric_index = _state["rubric_index"] % len(rubrics)
+news_index   = _state["news_index"]   % len(news_themes)
 
 def scheduled_rubric_post():
+    global rubric_index, news_index
     with ROT_LOCK:
-        global rubric_index
         rubric = rubrics[rubric_index]
         rubric_index = (rubric_index + 1) % len(rubrics)
+        _save_rotation_state(rubric_index, news_index)
     logger.info(f"⏳ Генерация рубричного поста: {rubric}")
 
     attempts = 0
@@ -518,10 +546,11 @@ def fetch_buzzy_rss_news(topic, per_feed=5, lookback_hours=48):
     return f"{pick['title']}: {summary}"
 
 def scheduled_news_post():
+    global rubric_index, news_index
     with ROT_LOCK:
-        global news_index
         topic = news_themes[news_index]
         news_index = (news_index + 1) % len(news_themes)
+        _save_rotation_state(rubric_index, news_index)
     today = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%-d %B %Y")
     logger.info(f"⏳ Генерация новостного поста: {topic}")
 
