@@ -6,6 +6,7 @@ import html
 import random
 import hashlib
 import logging
+import threading
 from io import BytesIO
 from time import mktime
 from datetime import datetime, timedelta
@@ -45,10 +46,11 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Moscow"))
 
+# блокировка на случай одновременных вызовов (scheduler + /test)
+ROT_LOCK = threading.Lock()
+
 NEGATIVE_SUFFIX = (
     "Строго БЕЗ текста, букв, цифр и логотипов. "
-    "Запрет: ракеты, шаттлы, выхлопное пламя, стартовые площадки, космос/звёзды как фон, "
-    "конусный нос и килевые стабилизаторы, эмблемы NASA/SpaceX. "
     "Запрет: плоская векторная графика, иконки, комикс, 2D-иллюстрация, клипарт."
 )
 
@@ -63,6 +65,12 @@ def ping():
 
 @app.route("/test")
 def manual_test():
+    # опциональная защита токеном: задайте TEST_TOKEN в ENV
+    token = request.args.get("token")
+    expected = os.getenv("TEST_TOKEN")
+    if expected and token != expected:
+        return "Forbidden", 403
+
     kind = request.args.get("type", "news")  # "news" или "rubric"
     try:
         if kind == "rubric":
@@ -214,7 +222,6 @@ rss_sources = {
     "Финансовые новости США и мира": [
         "https://www.ft.com/markets?format=rss",
         "https://feeds.marketwatch.com/marketwatch/topstories/",
-        # у Reuters стабильнее через feeds.reuters.com:
         "https://feeds.reuters.com/reuters/businessNews",
         "https://apnews.com/apf-business?output=rss",
     ],
@@ -365,7 +372,11 @@ def publish_post(content, image_url):
     """Сначала пытаемся отправить по URL, при неудаче — скачиваем и шлём как файл.
        Текст санитизируется и отправляется как HTML, чтобы жирный отработал стабильно."""
     try:
-        caption_html = _polish_and_to_html(content or "")
+        # безопасная длина до HTML, чтобы не упереться в лимит Telegram
+        plain = (content or "").strip()
+        if len(plain) > 980:
+            plain = plain[:980].rstrip() + "…"
+        caption_html = _polish_and_to_html(plain)
 
         # Попытка 1: URL
         try:
@@ -408,9 +419,10 @@ rubric_index = 0
 news_index = 0
 
 def scheduled_rubric_post():
-    global rubric_index
-    rubric = rubrics[rubric_index]
-    rubric_index = (rubric_index + 1) % len(rubrics)
+    with ROT_LOCK:
+        global rubric_index
+        rubric = rubrics[rubric_index]
+        rubric_index = (rubric_index + 1) % len(rubrics)
     logger.info(f"⏳ Генерация рубричного поста: {rubric}")
 
     attempts = 0
@@ -432,7 +444,7 @@ def scheduled_rubric_post():
          if line.strip().startswith(('📊','📈','📉','💰','🏦','💸','🧠','📌'))),
         text.split('\n')[0]
     )
-    image_url = generate_image(title_line, style="news")  # оставил как ты хотел — одинаковый стиль
+    image_url = generate_image(title_line, style="news")  # одинаковый стиль
     if image_url:
         publish_post(text, image_url)
 
@@ -442,15 +454,26 @@ def fetch_buzzy_rss_news(topic, per_feed=5, lookback_hours=48):
 
     for url in feeds:
         try:
-            feed = feedparser.parse(url)
+            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
             for e in feed.entries[:per_feed]:
-                if hasattr(e, "published_parsed") and e.published_parsed:
+                # published/updated fallback
+                if getattr(e, "published_parsed", None):
                     published = datetime.fromtimestamp(mktime(e.published_parsed), tz=pytz.UTC)
+                elif getattr(e, "updated_parsed", None):
+                    published = datetime.fromtimestamp(mktime(e.updated_parsed), tz=pytz.UTC)
                 else:
                     published = datetime.utcnow().replace(tzinfo=pytz.UTC)
 
+                # summary/description/content fallback
+                raw = e.get("summary") or e.get("description")
+                if not raw and e.get("content"):
+                    try:
+                        raw = e.content[0].value
+                    except Exception:
+                        raw = ""
+                summary = clean_html(raw).strip()
+
                 title = e.get("title", "").strip()
-                summary = clean_html(e.get("summary", "")).strip()
                 link = e.get("link", "")
 
                 if title:
@@ -505,23 +528,28 @@ def fetch_buzzy_rss_news(topic, per_feed=5, lookback_hours=48):
     summary = pick["summary"] or ""
     if len(summary) > 300:
         summary = summary[:300] + "..."
+    logger.info("📰 Источник: %s | %s", pick.get("title",""), pick.get("link",""))
     return f"{pick['title']}: {summary}"
 
 def scheduled_news_post():
-    global news_index
-    topic = news_themes[news_index]
-    news_index = (news_index + 1) % len(news_themes)
+    with ROT_LOCK:
+        global news_index
+        topic = news_themes[news_index]
+        news_index = (news_index + 1) % len(news_themes)
     today = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%-d %B %Y")
     logger.info(f"⏳ Генерация новостного поста: {topic}")
 
     rss_news = fetch_buzzy_rss_news(topic)
+    if not rss_news or rss_news.startswith("Нет актуальных новостей"):
+        logger.info("⏭️ Пропуск: нет свежих новостей по теме %s", topic)
+        return
     if len(rss_news) > 500:
         rss_news = rss_news[:500] + "..."
 
     user_prompt = (
         f"Составь актуальный Telegram-пост по теме: {topic}. "
         f"Дата: {today}. ФАКТЫ (не добавляй ничего сверх): {rss_news}. "
-        f"Сделай пост живым, структурным, не более 990 символов. В конце добавь вопрос подписчику."
+        f"Сделай пост живым, структурным, не более 990 символов. В конце добавь вопрос подписчику. "
         f"{CONCRETE_HINT_NEWS}"
     )
 
@@ -569,7 +597,7 @@ def test_news_post(rubric_name):
     user_prompt = (
         f"Составь актуальный Telegram-пост по теме: {rubric_name}. "
         f"Дата: {today}. Содержание новости: {rss_news}. "
-        f"Сделай пост живым, структурным, не более 990 символов. Вставь подзаголовок-зацеп. В конце — вопрос подписчику."
+        f"Сделай пост живым, структурным, не более 990 символов. Вставь подзаголовок-зацеп. В конце — вопрос подписчику. "
         f"{CONCRETE_HINT_NEWS}"
     )
     text = generate_post_text(user_prompt)
