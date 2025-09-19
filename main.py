@@ -181,28 +181,43 @@ rubrics = [
     "Инвест-горизонт", "Миф недели", "Путь к 1 млн", "Финансовая привычка",
     "Вопрос — ответ", "Excel / Таблица", "Финансовая цитата", "Инструмент недели"
 ]
-rubric_index = 0
-news_index = 0
 
 news_themes = [
     "Финансовые новости России",
     "Новости криптовалют",
-    "Новости фондовых рынков (Россия и США)"
+    "Новости фондовых рынков (Россия и США)",
+    "Финансовые новости США и мира",
 ]
+
 rss_sources = {
     "Финансовые новости России": [
         "https://rssexport.rbc.ru/rbcnews/news/20/full.rss",
         "https://tass.ru/rss/v2.xml?rubric=ekonomika",
-        "https://www.interfax.ru/rss.asp"
+        "https://www.interfax.ru/rss.asp",
+        "https://www.forbes.ru/newrss.xml",
+        "https://www.moex.com/export/news.aspx?cat=news&fmt=rss",
+        "https://www.vedomosti.ru/rss/news",
+        "https://www.kommersant.ru/RSS/news.xml",
     ],
     "Новости криптовалют": [
         "https://forklog.com/feed/",
-        "https://bitnovosti.com/feed/"
+        "https://bitnovosti.com/feed/",
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://www.theblock.co/rss",
+        "https://bits.media/rss/",
+        "https://decrypt.co/feed",
     ],
     "Новости фондовых рынков (Россия и США)": [
         "https://rssexport.rbc.ru/rbcnews/news/21/full.rss",
-        "https://www.finam.ru/rss/news.rss"
-    ]
+        "https://www.finam.ru/rss/news.rss",
+    ],
+    "Финансовые новости США и мира": [
+        "https://www.ft.com/markets?format=rss",
+        "https://feeds.marketwatch.com/marketwatch/topstories/",
+        # у Reuters стабильнее через feeds.reuters.com:
+        "https://feeds.reuters.com/reuters/businessNews",
+        "https://apnews.com/apf-business?output=rss",
+    ],
 }
 
 SYSTEM_PROMPT = (
