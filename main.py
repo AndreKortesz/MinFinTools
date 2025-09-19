@@ -8,6 +8,12 @@ import telegram
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask
+from time import mktime
+from datetime import datetime, timedelta
+import pytz
+import os, json, re, time, hashlib
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+
 
 NEGATIVE_SUFFIX = (
     "Строго БЕЗ текста, букв, цифр и логотипов. "
@@ -311,19 +317,70 @@ def scheduled_rubric_post():
     if image_url:
         publish_post(text, image_url)
 
-def fetch_top_rss_news(rubric_name):
-    feeds = rss_sources.get(rubric_name, [])
+def fetch_buzzy_rss_news(topic, per_feed=5, lookback_hours=48):
+    feeds = rss_sources.get(topic, [])
+    entries = []
+
     for url in feeds:
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries:
-                title = entry.title
-                summary = clean_html(entry.get("summary", ""))
-                if len(summary) > 50:
-                    return f"{title}: {summary}"
-        except Exception as e:
-            logger.error(f"Ошибка при парсинге RSS {url}: {e}")
-    return "Нет актуальных новостей по теме."
+            for e in feed.entries[:per_feed]:
+                published = None
+                if hasattr(e, "published_parsed") and e.published_parsed:
+                    published = datetime.fromtimestamp(mktime(e.published_parsed), tz=pytz.UTC)
+                else:
+                    published = datetime.utcnow().replace(tzinfo=pytz.UTC)
+
+                title = e.get("title", "").strip()
+                summary = clean_html(e.get("summary", "")).strip()
+                link = e.get("link", "")
+
+                if title:
+                    entries.append({
+                        "title": title,
+                        "summary": summary,
+                        "link": link,
+                        "published": published.isoformat()
+                    })
+        except Exception as ex:
+            logger.warning(f"RSS parse error {url}: {ex}")
+
+    if not entries:
+        return "Нет актуальных новостей по теме."
+
+    # фильтруем по свежести
+    cutoff = datetime.utcnow().replace(tzinfo=pytz.UTC) - timedelta(hours=lookback_hours)
+    fresh = [x for x in entries if datetime.fromisoformat(x["published"]) >= cutoff]
+    items = fresh or entries  # если ничего свежего — берём всё
+
+    # просим LLM выбрать «самую нашумевшую» (1 шт) по критериям
+    try:
+        headlines = "\n".join([f"{i+1}. {x['title']}" for i, x in enumerate(items[:30])])
+        prompt = (
+            "Ниже список заголовков по одной теме. Выбери РОВНО ОДНУ «самую нашумевшую» "
+            "с учётом повторяемости сюжета в разных источниках, свежести (сначала последние 24–48ч), значимости источника и масштаба последствий. "
+            "Ответ верни в JSON с полями: best_index (int, номер из списка, начиная с 1) и reason (кратко, 1 фраза). "
+            f"\n\nСписок заголовков:\n{headlines}"
+        )
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"user","content": prompt}],
+            temperature=0.2
+        )
+        import json
+        data = json.loads(resp.choices[0].message.content)
+        idx = int(data.get("best_index", 1)) - 1
+        pick = items[max(0, min(idx, len(items)-1))]
+    except Exception as ex:
+        logger.warning(f"LLM ranking failed, fallback to latest: {ex}")
+        # fallback: просто самая свежая
+        pick = sorted(items, key=lambda x: x["published"], reverse=True)[0]
+
+    # склеиваем в твоём старом формате
+    summary = pick["summary"] or ""
+    if len(summary) > 300:
+        summary = summary[:300] + "..."
+    return f"{pick['title']}: {summary}"
 
 def scheduled_news_post():
     global news_index
@@ -332,7 +389,7 @@ def scheduled_news_post():
     today = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%-d %B %Y")
     logger.info(f"⏳ Генерация новостного поста: {topic}")
 
-    rss_news = fetch_top_rss_news(topic)
+    rss_news = fetch_buzzy_rss_news(topic)
     if len(rss_news) > 500:
         rss_news = rss_news[:500] + "..."
 
@@ -352,6 +409,76 @@ def scheduled_news_post():
         image_url = generate_image(title_line, style="news")
         if image_url:
             publish_post(text, image_url)
+
+# после того как выбрали pick
+sid = _story_id(pick["title"], pick.get("link",""))
+if _is_seen(sid):
+    # найдём следующий подходящий (не виденный) из списка items
+    for x in items:
+        alt_sid = _story_id(x["title"], x.get("link",""))
+        if not _is_seen(alt_sid):
+            pick = x
+            sid = alt_sid
+            break
+_mark_seen(sid)
+# дальше сборка "title: summary"
+
+
+# ─── Хелперы ──────────────────────────────────────────
+def _load_seen():
+    if os.path.exists(SEEN_NEWS_FILE):
+        try:
+            return json.load(open(SEEN_NEWS_FILE, "r", encoding="utf-8"))
+        except Exception:
+            pass
+    return {}  # {story_id: ts}
+
+def _save_seen(seen: dict):
+    try:
+        json.dump(seen, open(SEEN_NEWS_FILE, "w", encoding="utf-8"), ensure_ascii=False)
+    except Exception:
+        pass
+
+def _prune_seen(seen: dict):
+    now = time.time()
+    cutoff = now - SEEN_MAX_DAYS * 86400
+    # по времени
+    for k in list(seen.keys()):
+        if seen[k] < cutoff:
+            del seen[k]
+    # по размеру
+    if len(seen) > SEEN_MAX_ITEMS:
+        # оставим самые свежие
+        keep = dict(sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:SEEN_MAX_ITEMS])
+        seen.clear()
+        seen.update(keep)
+
+def _canonical_link(link: str) -> str:
+    if not link:
+        return ""
+    try:
+        u = urlsplit(link)
+        # выбрасываем трекинг
+        q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True) if not k.lower().startswith("utm_")]
+        return urlunsplit((u.scheme, u.netloc.lower(), u.path, urlencode(sorted(q)), ""))  # без fragment
+    except Exception:
+        return link
+
+def _story_id(title: str, link: str) -> str:
+    canon = _canonical_link(link)
+    base = (canon or title or "").lower()
+    base = re.sub(r"\s+", " ", base)
+    base = re.sub(r"[^\w\s/.-]+", "", base)
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
+
+def _mark_seen(story_id: str):
+    seen = _load_seen()
+    seen[story_id] = time.time()
+    _prune_seen(seen)
+    _save_seen(seen)
+
+def _is_seen(story_id: str) -> bool:
+    return story_id in _load_seen()
 
 # ─── Расписание (МСК) — оставил твоё ──────────────────────────────────────────
 scheduler.add_job(scheduled_news_post, 'cron', hour=9, minute=26)
