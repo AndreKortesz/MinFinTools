@@ -1,6 +1,9 @@
 import os
 import logging
 import telegram
+import httpx
+from io import BytesIO
+import telegram
 from openai import OpenAI
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask
@@ -169,13 +172,41 @@ def publish_post(content, image_url):
     try:
         if len(content) > 1024:
             content = content[:1020] + "..."
+
+        # Сначала пробуем как URL (дешевле и быстрее)
+        try:
+            bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=image_url,
+                caption=content,
+                parse_mode=telegram.ParseMode.MARKDOWN
+            )
+            logger.info("✅ Пост опубликован по URL")
+            return
+        except BadRequest as e:
+            # Классические тексты ошибок от Telegram при недоступном URL
+            msg = str(e)
+            if ("Failed to get http url content" in msg
+                or "wrong type of the web page content" in msg
+                or "URL host is empty" in msg):
+                logger.warning("⚠️ TG не смог скачать изображение по URL, шлём как файл...")
+            else:
+                raise
+
+        # Скачиваем и шлём как файл (устойчивый путь)
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            resp = client.get(image_url)
+            resp.raise_for_status()
+            image_bytes = resp.content
+
+        file_obj = telegram.InputFile(BytesIO(image_bytes), filename="cover.png")
         bot.send_photo(
             chat_id=CHANNEL_ID,
-            photo=image_url,
+            photo=file_obj,
             caption=content,
             parse_mode=telegram.ParseMode.MARKDOWN
         )
-        logger.info("✅ Пост опубликован!")
+        logger.info("✅ Пост опубликован (отправлено как файл)")
     except Exception as e:
         logger.error(f"Ошибка публикации: {e}")
 
@@ -251,7 +282,7 @@ def scheduled_news_post():
             publish_post(text, image_url)
 
 # ─── Расписание (МСК) — оставил твоё ──────────────────────────────────────────
-scheduler.add_job(scheduled_news_post, 'cron', hour=9, minute=16)
+scheduler.add_job(scheduled_news_post, 'cron', hour=9, minute=26)
 scheduler.add_job(scheduled_rubric_post, 'cron', hour=11, minute=42)
 scheduler.add_job(scheduled_news_post, 'cron', hour=13, minute=24)
 scheduler.add_job(scheduled_rubric_post, 'cron', hour=16, minute=5)
