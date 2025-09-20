@@ -37,13 +37,17 @@ if not CHANNEL_ID:
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY не задан в переменных окружения")
 
+# ➕ Новое: базовый каталог для персистентных файлов (Railway Volume)
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
 # анти-повторы новостей — можно переопределять через ENV
-SEEN_NEWS_FILE = os.getenv("SEEN_NEWS_FILE", "/tmp/seen_news.json")
+SEEN_NEWS_FILE = os.getenv("SEEN_NEWS_FILE", os.path.join(DATA_DIR, "seen_news.json"))
 SEEN_MAX_DAYS = int(os.getenv("SEEN_MAX_DAYS", "7"))
 SEEN_MAX_ITEMS = int(os.getenv("SEEN_MAX_ITEMS", "1000"))
 
-# ➕ Новое: куда класть состояние ротации
-ROTATION_STATE_FILE = os.getenv("ROTATION_STATE_FILE", "/tmp/rotation_state.json")
+# ➕ Новое: куда класть состояние ротации (на Volume)
+ROTATION_STATE_FILE = os.getenv("ROTATION_STATE_FILE", os.path.join(DATA_DIR, "rotation_state.json"))
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
@@ -121,6 +125,7 @@ def _load_seen() -> dict:
 
 def _save_seen(seen: dict):
     try:
+        os.makedirs(os.path.dirname(SEEN_NEWS_FILE) or DATA_DIR, exist_ok=True)  # ➕ ensure dir
         with open(SEEN_NEWS_FILE, "w", encoding="utf-8") as f:
             json.dump(seen, f, ensure_ascii=False)
     except Exception:
@@ -159,6 +164,7 @@ def _load_rotation_state() -> dict:
 
 def _save_rotation_state(state: dict):
     try:
+        os.makedirs(os.path.dirname(ROTATION_STATE_FILE) or DATA_DIR, exist_ok=True)  # ➕ ensure dir
         tmp = ROTATION_STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False)
@@ -650,7 +656,8 @@ def fetch_buzzy_rss_news(topic, per_feed=5, lookback_hours=48):
             "Ответ верни в JSON с полями: best_index (int, начиная с 1) и reason (1 короткая фраза). "
             f"\n\nСписок заголовков:\n{headlines}"
         )
-        resp = client.chat_completions.create(  # совместимость, но у тебя ниже client.chat.completions.create — оставим так:
+        # ✔ фикс: используем тот же метод, что и в остальных местах
+        resp = client.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2
