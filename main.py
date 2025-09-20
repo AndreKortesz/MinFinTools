@@ -42,9 +42,6 @@ SEEN_NEWS_FILE = os.getenv("SEEN_NEWS_FILE", "/tmp/seen_news.json")
 SEEN_MAX_DAYS = int(os.getenv("SEEN_MAX_DAYS", "7"))
 SEEN_MAX_ITEMS = int(os.getenv("SEEN_MAX_ITEMS", "1000"))
 
-# файл состояния ротации (новое)
-ROTATION_STATE_FILE = os.getenv("ROTATION_STATE_FILE", "/tmp/rotation_state.json")
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Moscow"))
@@ -74,11 +71,14 @@ def manual_test():
     if expected and token != expected:
         return "Forbidden", 403
 
-    kind = request.args.get("type", "news")  # "news" или "rubric"
+    kind = request.args.get("type", "news")  # "news" | "rubric" | "history"
     try:
         if kind == "rubric":
             scheduled_rubric_post()
             return "✅ Отправлен следующий рубричный пост по ротации", 200
+        elif kind == "history":
+            scheduled_history_post()
+            return "✅ Отправлен исторический пост «В этот день в финансах»", 200
         else:
             scheduled_news_post()
             return "✅ Отправлен следующий новостной пост по ротации", 200
@@ -185,29 +185,6 @@ def _polish_and_to_html(text: str) -> str:
 
     return t.strip()
 
-# ─── Персистентная ротация (новое) ────────────────────────────────────────────
-def _load_rotation_state():
-    try:
-        with open(ROTATION_STATE_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        return {
-            "rubric_index": int(d.get("rubric_index", 0)),
-            "news_index":   int(d.get("news_index", 0)),
-        }
-    except Exception:
-        return {"rubric_index": 0, "news_index": 0}
-
-def _save_rotation_state(rubric_index: int, news_index: int):
-    data = {
-        "rubric_index": int(rubric_index),
-        "news_index":   int(news_index),
-        "ts":           time.time(),
-    }
-    tmp = ROTATION_STATE_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, ROTATION_STATE_FILE)
-
 # ─── Контентные настройки (оставлены как были) ────────────────────────────────
 rubrics = [
     "Финсовет дня", "Финликбез", "Личный финменеджмент", "Деньги в цифрах",
@@ -231,7 +208,7 @@ rss_sources = {
         "https://www.forbes.ru/newrss.xml",
         "https://www.moex.com/export/news.aspx?cat=news&fmt=rss",
         "https://www.vedomosti.ru/rss/news",
-        "https://www.kommersant.ru/RSS/news.xml",
+        "https://www.коммерсант.ru/RSS/news.xml".replace("коммерсант", "kommersant"),
     ],
     "Новости криптовалют": [
         "https://forklog.com/feed/",
@@ -295,7 +272,16 @@ CONCRETE_HINT_NEWS = (
     "В конце добавь блок **🧭 Что делать инвестору:** 2–3 пункта, основанные на этих фактах (без новых цифр)."
 )
 
-# ─── Генерация текста/картинок (контент не менял) ─────────────────────────────
+# ➕ Новое: подсказка для исторической рубрики
+HISTORY_HINT = (
+    "Это рубрика «В этот день в финансах». Начни с заголовка «📅 В этот день в финансах». "
+    "Обязательно назови год в первой строке фактов. Коротко опиши событие и почему оно важно для экономики/рынков. "
+    "Добавь блок **📊 Контекст:** 1–2 предложения. "
+    "Добавь блок **🧭 Урок инвестору:** 2–3 пункта. Никаких выдуманных фактов или цифр — только из справки. "
+    "Если исходник на английском — переведи аккуратно на русский."
+)
+
+# ─── Генерация текста/картинок ────────────────────────────────────────────────
 def generate_post_text(user_prompt, system_prompt=None):
     try:
         for _ in range(5):
@@ -317,7 +303,7 @@ def generate_post_text(user_prompt, system_prompt=None):
 
 def generate_image(title_line, style="news"):
     try:
-        stripped_title = title_line.strip('📊📈📉💰🏦💸🧠📌').strip()
+        stripped_title = title_line.strip('📊📈📉💰🏦💸🧠📌📅').strip()
 
         # вариативность, чтобы картинки не повторялись
         lenses  = ["85mm lens", "50mm prime", "35mm wide", "telephoto compression"]
@@ -427,16 +413,22 @@ def publish_post(content, image_url):
         logger.error(f"Ошибка публикации: {e}")
 
 # ─── Ротация постов ───────────────────────────────────────────────────────────
-_state = _load_rotation_state()
-rubric_index = _state["rubric_index"] % len(rubrics)
-news_index   = _state["news_index"]   % len(news_themes)
+rubric_index = 0
+news_index = 0
+
+def _pick_title_line(text: str) -> str:
+    """Берём строку-заголовок (учитываем 📅 для истории)."""
+    return next(
+        (line for line in (text or "").split('\n')
+         if line.strip().startswith(('📊','📈','📉','💰','🏦','💸','🧠','📌','📅'))),
+        (text or "").split('\n')[0]
+    )
 
 def scheduled_rubric_post():
-    global rubric_index, news_index
     with ROT_LOCK:
+        global rubric_index
         rubric = rubrics[rubric_index]
         rubric_index = (rubric_index + 1) % len(rubrics)
-        _save_rotation_state(rubric_index, news_index)
     logger.info(f"⏳ Генерация рубричного поста: {rubric}")
 
     attempts = 0
@@ -453,15 +445,118 @@ def scheduled_rubric_post():
         logger.warning("⚠️ GPT не смог уложиться в лимит. Возвращаем None.")
         return
 
-    title_line = next(
-        (line for line in text.split('\n')
-         if line.strip().startswith(('📊','📈','📉','💰','🏦','💸','🧠','📌'))),
-        text.split('\n')[0]
-    )
+    title_line = _pick_title_line(text)
     image_url = generate_image(title_line, style="news")  # одинаковый стиль
     if image_url:
         publish_post(text, image_url)
 
+# ── NEW: «В этот день в финансах» ─────────────────────────────────────────────
+_FIN_KW_RU = [
+    "банк", "банков", "бирж", "акци", "облигац", "валют", "доллар", "евро", "рубл",
+    "финанс", "налог", "бюджет", "дефолт", "кризис", "инфляц", "ипотек", "золото",
+    "золотой стандарт", "бреттон-вудс", "центробанк", "фрс", "ецб", "казначейств",
+    "рынок", "торгов", "санкц", "эмисси", "банкротств"
+]
+_FIN_KW_EN = [
+    "bank", "banking", "stock", "exchange", "bond", "currency", "dollar", "euro", "ruble",
+    "finance", "tax", "budget", "default", "crisis", "inflation", "mortgage", "gold",
+    "gold standard", "bretton woods", "central bank", "federal reserve", "ecb",
+    "treasury", "market", "trade", "sanction", "emission", "bankruptcy", "panic",
+    "great depression", "oil crisis", "dot-com", "credit"
+]
+
+def _score_fin_event(txt: str) -> int:
+    t = (txt or "").lower()
+    score = 0
+    for w in _FIN_KW_RU:
+        if w in t: score += 2
+    for w in _FIN_KW_EN:
+        if w in t: score += 2
+    # сильные маркеры
+    for w in ["кризис", "default", "panic", "бреттон", "bretton", "gold standard", "great depression", "bankruptcy"]:
+        if w in t: score += 4
+    return score
+
+def fetch_finance_event_today():
+    """Берём событие этого дня из Wikipedia (ru → en fallback), фильтруем по финансам."""
+    now = datetime.now(pytz.timezone("Europe/Moscow"))
+    m, d = now.month, now.day
+    urls = [
+        f"https://ru.wikipedia.org/api/rest_v1/feed/onthisday/events/{m}/{d}",
+        f"https://en.wikipedia.org/api/rest_v1/feed/onthisday/events/{m}/{d}",
+    ]
+    headers = {"User-Agent": "MinFinToolsBot/1.0 (+telegram)"}
+
+    candidates = []
+    for url in urls:
+        try:
+            r = httpx.get(url, headers=headers, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            for ev in data.get("events", []):
+                year = ev.get("year")
+                text = ev.get("text", "")  # краткое описание
+                pages = ev.get("pages") or []
+                title = pages[0].get("normalizedtitle") if pages else ""
+                extract = pages[0].get("extract") if pages else ""
+                link = ""
+                try:
+                    link = pages[0]["content_urls"]["desktop"]["page"]
+                except Exception:
+                    pass
+
+                blob = " ".join([str(year or ""), title or "", text or "", extract or ""])
+                score = _score_fin_event(blob)
+                if score > 0:  # считаем финансовым
+                    candidates.append({
+                        "year": year,
+                        "title": title or text[:120],
+                        "summary": text or extract or "",
+                        "link": link,
+                        "lang": "ru" if "ru.wikipedia.org" in url else "en",
+                        "score": score
+                    })
+        except Exception as ex:
+            logger.warning("OnThisDay fetch fail %s: %s", url, ex)
+
+    if not candidates:
+        return None
+
+    # берём самый «финансовый»
+    pick = sorted(candidates, key=lambda x: (x["score"], x["year"] or 0), reverse=True)[0]
+    return pick
+
+def scheduled_history_post():
+    """Пост «В этот день в финансах» — 08:30 ежедневно."""
+    evt = fetch_finance_event_today()
+    if not evt:
+        logger.info("⏭️ Историческое событие не найдено — пропуск.")
+        return
+
+    today = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%-d %B %Y")
+    facts = f"{evt.get('year','?')}: {evt.get('title','')} — {evt.get('summary','')}"
+    # страхуем длину фактов, чтобы не раздувать prompt
+    facts = facts.strip()
+    if len(facts) > 600:
+        facts = facts[:600].rstrip() + "…"
+    src = evt.get("link") or ""
+
+    user_prompt = (
+        f"Сделай пост для рубрики «В этот день в финансах». Дата: {today}. "
+        f"ФАКТЫ (без домыслов): {facts}. Источник: {src}. "
+        f"{HISTORY_HINT}"
+    )
+
+    text = generate_post_text(user_prompt)
+    if not text:
+        return
+    title_line = _pick_title_line(text)
+    # для исторической рубрики используем чуть «светлее» оформление
+    image_url = generate_image(title_line, style="rubric")
+    if image_url:
+        publish_post(text, image_url)
+
+# ─── Новости (как было) ───────────────────────────────────────────────────────
 def fetch_buzzy_rss_news(topic, per_feed=5, lookback_hours=48):
     feeds = rss_sources.get(topic, [])
     entries = []
@@ -546,11 +641,10 @@ def fetch_buzzy_rss_news(topic, per_feed=5, lookback_hours=48):
     return f"{pick['title']}: {summary}"
 
 def scheduled_news_post():
-    global rubric_index, news_index
     with ROT_LOCK:
+        global news_index
         topic = news_themes[news_index]
         news_index = (news_index + 1) % len(news_themes)
-        _save_rotation_state(rubric_index, news_index)
     today = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%-d %B %Y")
     logger.info(f"⏳ Генерация новостного поста: {topic}")
 
@@ -570,16 +664,12 @@ def scheduled_news_post():
 
     text = generate_post_text(user_prompt)
     if text:
-        title_line = next(
-            (line for line in text.split('\n')
-             if line.strip().startswith(('📊','📈','📉','💰','🏦','💸','🧠','📌'))),
-            text.split('\n')[0]
-        )
+        title_line = _pick_title_line(text)
         image_url = generate_image(title_line, style="news")
         if image_url:
             publish_post(text, image_url)
 
-# ─── Ручные тесты (как были, только fetch_buzzy_rss_news) ─────────────────────
+# ─── Ручные тесты (как были) ──────────────────────────────────────────────────
 def test_rubric_post(rubric_name):
     logger.info(f"⏳ Ручная генерация рубричного поста: {rubric_name}")
     attempts, text = 0, None
@@ -594,11 +684,7 @@ def test_rubric_post(rubric_name):
     else:
         logger.warning("⚠️ GPT не смог уложиться в лимит. Возвращаем None.")
         return
-    title_line = next(
-        (line for line in text.split('\n')
-         if line.strip().startswith(('📊','📈','📉','💰','🏦','💸','🧠','📌'))),
-        text.split('\n')[0]
-    )
+    title_line = _pick_title_line(text)
     image_url = generate_image(title_line, style="news")
     if image_url:
         publish_post(text, image_url)
@@ -617,16 +703,15 @@ def test_news_post(rubric_name):
     )
     text = generate_post_text(user_prompt)
     if text:
-        title_line = next(
-            (line for line in text.split('\n')
-             if line.strip().startswith(('📊','📈','📉','💰','🏦','💸','🧠','📌'))),
-            text.split('\n')[0]
-        )
+        title_line = _pick_title_line(text)
         image_url = generate_image(title_line, style="news")
         if image_url:
             publish_post(text, image_url)
 
-# ─── Расписание (МСК) — оставил как у тебя ────────────────────────────────────
+# ─── Расписание (МСК) ─────────────────────────────────────────────────────────
+# новый пост истории — САМЫЙ ПЕРВЫЙ
+scheduler.add_job(scheduled_history_post, 'cron', hour=8,  minute=30)
+
 scheduler.add_job(scheduled_news_post,   'cron', hour=9,  minute=26)
 scheduler.add_job(scheduled_rubric_post, 'cron', hour=11, minute=42)
 scheduler.add_job(scheduled_news_post,   'cron', hour=13, minute=24)
