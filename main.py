@@ -513,7 +513,7 @@ def scheduled_rubric_post():
     idx = _next_index("rubric", len(rubrics))
     rubric = rubrics[idx]
 
-    # страховка от двух одинаковых рубрик подряд (если rotation_state вдруг не сохранился)
+    # страховка от двух одинаковых рубрик подряд
     state = _load_rotation_state()
     last = state.get("last_rubric")
     if last == rubric:
@@ -524,8 +524,10 @@ def scheduled_rubric_post():
 
     logger.info(f"⏳ Генерация рубричного поста: {rubric}")
 
-    # подкидываем новые числа для возможного примера-расчёта (без хардкода 70 000)
-    example_cost = _fresh_monthly_expense()
+    # подкидываем новые числа для примера-расчёта без отдельной функции
+    example_cost = random.choice(
+        list(range(45_000, 100_000, 5_000)) + [110_000, 120_000, 135_000, 150_000, 160_000]
+    )
 
     user_prompt = (
         f"Создай структурированный и интересный Telegram-пост по рубрике: «{rubric}». "
