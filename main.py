@@ -358,13 +358,15 @@ HISTORY_HINT = (
 # ─── Генерация текста/картинок ────────────────────────────────────────────────
 def generate_post_text(user_prompt, system_prompt=None):
     try:
+        sys_prompt = system_prompt or SYSTEM_PROMPT
         for _ in range(5):
             response = client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": sys_prompt},
                     {"role": "user", "content": user_prompt}
-                ]
+                ],
+                temperature=0.6,
             )
             content = response.choices[0].message.content.strip().replace("###", "")
             if len(content) <= 1015:
@@ -507,18 +509,33 @@ def _pick_title_line(text: str) -> str:
     )
 
 def scheduled_rubric_post():
-    # 🔁 теперь индексы устойчивы к перезапуску
+    # индексы устойчивы к перезапуску
     idx = _next_index("rubric", len(rubrics))
     rubric = rubrics[idx]
+
+    # страховка от двух одинаковых рубрик подряд (если rotation_state вдруг не сохранился)
+    state = _load_rotation_state()
+    last = state.get("last_rubric")
+    if last == rubric:
+        idx = _next_index("rubric", len(rubrics))
+        rubric = rubrics[idx]
+    state["last_rubric"] = rubric
+    _save_rotation_state(state)
+
     logger.info(f"⏳ Генерация рубричного поста: {rubric}")
 
-    attempts = 0
-    text = None
+    # подкидываем новые числа для возможного примера-расчёта (без хардкода 70 000)
+    example_cost = _fresh_monthly_expense()
+
+    user_prompt = (
+        f"Создай структурированный и интересный Telegram-пост по рубрике: «{rubric}». "
+        f"Если уместен пример-расчёт — возьми месячный расход {example_cost} ₽ и рассчитай диапазон 3–6 месяцев. "
+        f"{CONCRETE_HINT_RUBRIC}"
+    )
+
+    attempts, text = 0, None
     while attempts < 5:
-        text = generate_post_text(
-            f"Создай структурированный и интересный Telegram-пост по рубрике: {rubric}. {CONCRETE_HINT_RUBRIC}",
-            system_prompt=SYSTEM_PROMPT
-        )
+        text = generate_post_text(user_prompt, system_prompt=SYSTEM_PROMPT)
         if text and len(text) <= 1015:
             break
         attempts += 1
@@ -527,7 +544,7 @@ def scheduled_rubric_post():
         return
 
     title_line = _pick_title_line(text)
-    image_url = generate_image(title_line, style="news")  # одинаковый стиль
+    image_url = generate_image(title_line, style="news")
     if image_url:
         publish_post(text, image_url)
 
