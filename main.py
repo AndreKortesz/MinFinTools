@@ -42,6 +42,9 @@ SEEN_NEWS_FILE = os.getenv("SEEN_NEWS_FILE", "/tmp/seen_news.json")
 SEEN_MAX_DAYS = int(os.getenv("SEEN_MAX_DAYS", "7"))
 SEEN_MAX_ITEMS = int(os.getenv("SEEN_MAX_ITEMS", "1000"))
 
+# ➕ Новое: куда класть состояние ротации
+ROTATION_STATE_FILE = os.getenv("ROTATION_STATE_FILE", "/tmp/rotation_state.json")
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Moscow"))
@@ -144,6 +147,42 @@ def _mark_seen(story_id: str):
 
 def _is_seen(story_id: str) -> bool:
     return story_id in _load_seen()
+
+# ➕ Новое: персистентная ротация индексов
+def _load_rotation_state() -> dict:
+    try:
+        with open(ROTATION_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _save_rotation_state(state: dict):
+    try:
+        tmp = ROTATION_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, ROTATION_STATE_FILE)  # атомарная запись
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить состояние ротации: {e}")
+
+def _next_index(kind: str, total: int) -> int:
+    """
+    Возвращает ТЕКУЩИЙ индекс для kind ('rubric'|'news') и сразу
+    продвигает его на +1 по кольцу. Потокобезопасно и переживает перезапуски.
+    """
+    with ROT_LOCK:
+        state = _load_rotation_state()
+        key = f"{kind}_index"
+        idx = int(state.get(key, 0))
+        state[key] = (idx + 1) % total
+        _save_rotation_state(state)
+        # держим глобалки в синхроне (если где-то читаются)
+        if kind == "rubric":
+            globals()["rubric_index"] = state[key]
+        elif kind == "news":
+            globals()["news_index"] = state[key]
+        return idx
 
 def _polish_and_to_html(text: str) -> str:
     """
@@ -425,10 +464,9 @@ def _pick_title_line(text: str) -> str:
     )
 
 def scheduled_rubric_post():
-    with ROT_LOCK:
-        global rubric_index
-        rubric = rubrics[rubric_index]
-        rubric_index = (rubric_index + 1) % len(rubrics)
+    # 🔁 теперь индексы устойчивы к перезапуску
+    idx = _next_index("rubric", len(rubrics))
+    rubric = rubrics[idx]
     logger.info(f"⏳ Генерация рубричного поста: {rubric}")
 
     attempts = 0
@@ -612,7 +650,7 @@ def fetch_buzzy_rss_news(topic, per_feed=5, lookback_hours=48):
             "Ответ верни в JSON с полями: best_index (int, начиная с 1) и reason (1 короткая фраза). "
             f"\n\nСписок заголовков:\n{headlines}"
         )
-        resp = client.chat.completions.create(
+        resp = client.chat_completions.create(  # совместимость, но у тебя ниже client.chat.completions.create — оставим так:
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2
@@ -641,10 +679,9 @@ def fetch_buzzy_rss_news(topic, per_feed=5, lookback_hours=48):
     return f"{pick['title']}: {summary}"
 
 def scheduled_news_post():
-    with ROT_LOCK:
-        global news_index
-        topic = news_themes[news_index]
-        news_index = (news_index + 1) % len(news_themes)
+    # 🔁 теперь индексы устойчивы к перезапуску
+    idx = _next_index("news", len(news_themes))
+    topic = news_themes[idx]
     today = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%-d %B %Y")
     logger.info(f"⏳ Генерация новостного поста: {topic}")
 
