@@ -41,6 +41,9 @@ if not OPENAI_API_KEY:
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Максимальная длина подписи к фото в Telegram
+CAPTION_LIMIT = int(os.getenv("TG_CAPTION_LIMIT", "1024"))
+
 # анти-повторы новостей — можно переопределять через ENV
 SEEN_NEWS_FILE = os.getenv("SEEN_NEWS_FILE", os.path.join(DATA_DIR, "seen_news.json"))
 SEEN_MAX_DAYS = int(os.getenv("SEEN_MAX_DAYS", "7"))
@@ -230,6 +233,32 @@ def _polish_and_to_html(text: str) -> str:
 
     return t.strip()
 
+def _regenerate_to_fit(original_text: str, target_limits=(940, 900, 860)) -> str:
+    """
+    Перегенерирует пост короче, чтобы уместиться в лимит подписи Telegram после HTML.
+    Не добавляет «…», не обрезает — просит LLM написать компактнее.
+    """
+    base = (original_text or "").strip()
+    for tgt in target_limits:
+        try:
+            prompt = (
+                "Перепиши этот пост КОРОЧЕ, сохранив структуру и смысл: "
+                "заголовок с эмодзи, подзаголовок-зацеп, краткое вступление, "
+                "жирные подзаголовки, аналитика/прогноз, вывод, вопрос в конце. "
+                "Без хештегов. Без искусственного многоточия в конце. "
+                f"СТРОГО: общий объём не более {tgt} символов в чистом тексте.\n\n"
+                f"Текст:\n{base}"
+            )
+            new_text = generate_post_text(prompt)
+            if not new_text:
+                continue
+            html_ver = _polish_and_to_html(new_text)
+            if len(html_ver) <= CAPTION_LIMIT:
+                return new_text.strip()
+        except Exception:
+            continue
+    return base  # если не уложились после нескольких попыток — вернём исходник
+
 # ─── Контентные настройки (оставлены как были) ────────────────────────────────
 rubrics = [
     "Финсовет дня", "Финликбез", "Личный финменеджмент", "Деньги в цифрах",
@@ -413,13 +442,21 @@ def generate_image(title_line, style="news"):
 
 def publish_post(content, image_url):
     """Сначала пытаемся отправить по URL, при неудаче — скачиваем и шлём как файл.
-       Текст санитизируется и отправляется как HTML, чтобы жирный отработал стабильно."""
+       Текст отправляем как HTML. Если превышен лимит Telegram — ПЕРЕГЕНЕРИРУЕМ, а не обрезаем."""
     try:
-        # безопасная длина до HTML, чтобы не упереться в лимит Telegram
         plain = (content or "").strip()
-        if len(plain) > 980:
-            plain = plain[:980].rstrip() + "…"
+
+        # 1) первичная сборка HTML
         caption_html = _polish_and_to_html(plain)
+
+        # 2) если выходим за лимит — просим модель написать компактнее и пересобираем
+        if len(caption_html) > CAPTION_LIMIT:
+            compact_plain = _regenerate_to_fit(plain)
+            caption_html = _polish_and_to_html(compact_plain)
+            # дополнительная страховка: если вдруг всё ещё длинно — ещё одна попытка
+            if len(caption_html) > CAPTION_LIMIT:
+                compact_plain = _regenerate_to_fit(compact_plain, target_limits=(880, 840, 800))
+                caption_html = _polish_and_to_html(compact_plain)
 
         # Попытка 1: URL
         try:
