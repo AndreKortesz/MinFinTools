@@ -95,6 +95,31 @@ def manual_test():
     except Exception as e:
         return f"❌ Ошибка: {e}", 500
 
+@app.route("/debug/ls")
+def debug_ls():
+    token = request.args.get("token"); expected = os.getenv("TEST_TOKEN")
+    if expected and token != expected: return "Forbidden", 403
+    try:
+        items = []
+        for name in os.listdir(DATA_DIR):
+            p = os.path.join(DATA_DIR, name); st = os.stat(p)
+            items.append({"name": name, "size": st.st_size,
+                          "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                          "is_dir": os.path.isdir(p)})
+        return {"DATA_DIR": DATA_DIR, "files": items}, 200
+    except Exception as e:
+        return {"DATA_DIR": DATA_DIR, "error": str(e)}, 500
+
+@app.route("/debug/file")
+def debug_file():
+    token = request.args.get("token"); expected = os.getenv("TEST_TOKEN")
+    if expected and token != expected: return "Forbidden", 403
+    name = request.args.get("name", ""); path = os.path.join(DATA_DIR, name)
+    if not name: return "Use ?name=rotation_state.json", 400
+    if not os.path.exists(path): return {"exists": False, "path": path}, 404
+    with open(path, "r", encoding="utf-8") as f:
+        return {"exists": True, "path": path, "content": f.read()}, 200
+
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 def clean_html(raw_html: str) -> str:
     return re.sub(re.compile('<.*?>'), '', raw_html or "")
