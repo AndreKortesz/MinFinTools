@@ -60,7 +60,11 @@ scheduler = BackgroundScheduler(timezone=pytz.timezone("Europe/Moscow"))
 ROT_LOCK = threading.Lock()
 
 NEGATIVE_SUFFIX = (
-    "Строго БЕЗ текста, букв, цифр и логотипов. "
+    "No text or numbers anywhere. "
+    "No letters, words, digits, currency signs or tickers. "
+    "No logos, watermarks, stamps or signatures. "
+    "Avoid UI/screens/dashboards or charts with labels and any signage. "
+    "Use clean, unlabeled geometry if needed."
     "Запрет: плоская векторная графика, иконки, комикс, 2D-иллюстрация, клипарт."
 )
 
