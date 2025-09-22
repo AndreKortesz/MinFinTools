@@ -383,51 +383,23 @@ def generate_image(title_line, style="news"):
     try:
         stripped_title = title_line.strip('📊📈📉💰🏦💸🧠📌📅').strip()
 
-        # вариативность, чтобы картинки не повторялись
-        lenses  = ["85mm lens", "50mm prime", "35mm wide", "telephoto compression"]
-        cameras = ["three-quarters view", "low-angle hero shot", "top-down minimal", "isometric semi-orthographic"]
-        lights  = ["global illumination", "soft studio lighting", "volumetric light", "rim light, subtle bloom"]
-        moods   = ["optimistic growth", "tense volatility", "calm stability", "cautious uncertainty", "analytical, high-tech"]
-        envs    = [
-            "sleek trading desk with glass surfaces",
-            "abstract city skyline of a financial district",
-            "clean studio with floating glass charts",
-            "minimal architectural space with columns",
-            "macro world of money props (paper, metal, glass) without text"
-        ]
-        devices = [
-            "subtle wavy glass charts (volatility)",
-            "gradually rising geometric bars (growth)",
-            "balancing scales or counterweights (risk)",
-            "interlocking blocks (diversification)",
-            "flowing liquid glass shapes (liquidity)",
-            "soft bokeh particles and thin market grid lines"
-        ]
+        # Минимальный промпт: сцена по смыслу заголовка, реалистичный 3D, без текстов/логотипов
+        base_prompt = (
+            "Create a photorealistic, stylized 3D illustration that CLEARLY conveys the meaning of this Russian headline: "
+            f"“{stripped_title}”. "
+            "It should look realistic but not like a real photo (premium Midjourney-like style). "
+            "Build a small coherent scene that directly visualizes the idea from the headline (objects, locations, actions), "
+            "not abstract icons or generic finance symbols. "
+            "Use believable PBR materials, soft cinematic lighting, natural reflections/occlusion, gentle bloom. "
+            "Square 1:1. No people. No text, no numbers, no logos."
+        )
 
-        # общая формулировка — сюжетная сцена по смыслу заголовка
-        base_prompt = f"""
-            Create a premium, photorealistic 3D narrative scene (not a single centered emblem) that visually conveys
-            the meaning of the headline: “{stripped_title}”. Use believable PBR materials, ray-traced reflections,
-            depth of field and cinematic contrast. Environment: {random.choice(envs)}.
-            Camera: {random.choice(cameras)} with {random.choice(lenses)}.
-            Lighting: {random.choice(lights)}. Mood: {random.choice(moods)}.
-            Include 2–3 subtle visual metaphors appropriate to the headline, such as {', '.join(random.sample(devices, 3))}.
-            No people. Square 1:1. Clean composition, premium finance aesthetics.
-            Strictly no text, numbers or logos.
-        """
-
-        if style == "rubric":
-            # рубричные — немного светлее и с аккуратным дизайн-акцентом
-            style_hint = (
-                "Slightly brighter neutral background, gentle studio feel. "
-                "Optionally a very subtle design accent (faint dotted grid or thin soft border), not distracting."
-            )
-        else:
-            # новости — темнее, динамичнее
-            style_hint = (
-                "Darker premium background and a more dynamic overall composition. "
-                "Keep it tasteful and realistic."
-            )
+        # Минимальный оттенок для различия новость/рубрика — без навязывания композиции
+        style_hint = (
+            "Slightly darker background and a bit more dramatic contrast."
+            if style == "news"
+            else "Slightly brighter neutral background; calm premium look."
+        )
 
         prompt = base_prompt + "\n" + style_hint + "\n" + NEGATIVE_SUFFIX
 
